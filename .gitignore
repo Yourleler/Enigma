@@ -1,0 +1,54 @@
+# Bytecode and interpreter caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local dependency state
+.venv/
+venv/
+env/
+ENV/
+uv.lock
+
+# Build and packaging output
+*.egg-info/
+build/
+dist/
+
+# Test, lint, coverage, and benchmark caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest-tmp/
+pytest-tmp/
+
+# Enigma local runtime state
+.enigma/
+.mini-coding-agent/
+MEMORY.md
+
+# Local scratch space and generated artifacts
+tmp/
+temp/
+.worktrees/
+.pico/
+artifacts/
+readme_intro_locked/
+
+# Local/private machine metadata
+folder-alias.json
+private-folder-alias.json
+.claude/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
