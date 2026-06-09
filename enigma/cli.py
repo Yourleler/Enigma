@@ -31,10 +31,10 @@ DEFAULT_SECRET_ENV_NAMES = (
 )
 
 WELCOME_ART = (
-    "        /\\___/\\\\",
-    "       (  o o  )",
-    "       /   ^   \\\\",
-    "      /|       |\\\\",
+    "        /\\_/\\",
+    "       ( o.o )",
+    "       /  ^  \\",
+    "      /|     |\\",
 )
 WELCOME_NAME = "enigma"
 WELCOME_SUBTITLE = "local coding agent"
