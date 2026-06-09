@@ -4,6 +4,8 @@
 如何做参数校验，以及最终如何执行，都是在这里定义的。
 """
 
+import fnmatch
+import re
 import shutil
 import subprocess
 import textwrap
@@ -27,6 +29,16 @@ BASE_TOOL_SPECS = {
         "schema": {"pattern": "str", "path": "str='.'"},
         "risky": False,
         "description": "Search the workspace with rg or a simple fallback.",
+    },
+    "glob": {
+        "schema": {"pattern": "str", "path": "str='.'"},
+        "risky": False,
+        "description": "Find workspace files by glob pattern.",
+    },
+    "symbol_search": {
+        "schema": {"query": "str", "path": "str='.'", "kind": "str=''"},
+        "risky": False,
+        "description": "Find definitions, types, or references with lightweight source patterns.",
     },
     "web_search": {
         "schema": {"query": "str", "max_results": "int=5", "allowed_domains": "str=''", "blocked_domains": "str=''"},
@@ -52,7 +64,7 @@ BASE_TOOL_SPECS = {
 
 DELEGATE_TOOL_SPEC = {
     "schema": {"task": "str", "max_steps": "int=3"},
-    "risky": False,
+    "risky": True,
     "description": "Ask a bounded read-only child agent to investigate.",
 }
 
@@ -60,6 +72,8 @@ TOOL_EXAMPLES = {
     "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
     "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
     "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
+    "glob": '<tool>{"name":"glob","args":{"pattern":"**/*.py","path":"."}}</tool>',
+    "symbol_search": '<tool>{"name":"symbol_search","args":{"query":"build_agent","kind":"definition","path":"."}}</tool>',
     "web_search": '<tool>{"name":"web_search","args":{"query":"latest Python release","max_results":5}}</tool>',
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
@@ -112,6 +126,27 @@ def validate_tool(agent, name, args):
         agent.path(args.get("path", "."))
         return
 
+    if name == "glob":
+        pattern = str(args.get("pattern", "")).strip()
+        if not pattern:
+            raise ValueError("pattern must not be empty")
+        if len(pattern) > 200:
+            raise ValueError("pattern must be at most 200 characters")
+        agent.path(args.get("path", "."))
+        return
+
+    if name == "symbol_search":
+        query = str(args.get("query", "")).strip()
+        if not query:
+            raise ValueError("query must not be empty")
+        if len(query) > 120:
+            raise ValueError("query must be at most 120 characters")
+        kind = str(args.get("kind", "")).strip().lower()
+        if kind and kind not in {"definition", "function", "class", "type", "import", "reference"}:
+            raise ValueError("kind must be one of definition, function, class, type, import, reference")
+        agent.path(args.get("path", "."))
+        return
+
     if name == "web_search":
         query = str(args.get("query", "")).strip()
         if not query:
@@ -151,7 +186,7 @@ def validate_tool(agent, name, args):
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(**agent.harness_policy.tool.text_read_kwargs())
         count = text.count(old_text)
         if count != 1:
             raise ValueError(f"old_text must occur exactly once, found {count}")
@@ -187,7 +222,8 @@ def tool_read_file(agent, args):
     end = int(args.get("end", 200))
     if start < 1 or end < start:
         raise ValueError("invalid line range")
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    read_kwargs = agent.harness_policy.tool.text_read_kwargs()
+    lines = path.read_text(**read_kwargs).splitlines()
     body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
     return f"# {path.relative_to(agent.root)}\n{body}"
 
@@ -219,6 +255,101 @@ def tool_search(agent, args):
                 matches.append(f"{file_path.relative_to(agent.root)}:{number}:{line}")
                 if len(matches) >= 200:
                     return "\n".join(matches)
+    return "\n".join(matches) or "(no matches)"
+
+
+def _iter_workspace_files(agent, path, limit=5000):
+    if path.is_file():
+        yield path
+        return
+    count = 0
+    for file_path in sorted(path.rglob("*"), key=lambda item: item.relative_to(agent.root).as_posix()):
+        if not file_path.is_file():
+            continue
+        relative_parts = file_path.relative_to(agent.root).parts
+        if any(part in IGNORED_PATH_NAMES for part in relative_parts):
+            continue
+        yield file_path
+        count += 1
+        if count >= limit:
+            return
+
+
+def tool_glob(agent, args):
+    pattern = str(args.get("pattern", "")).strip()
+    if not pattern:
+        raise ValueError("pattern must not be empty")
+    path = agent.path(args.get("path", "."))
+    matches = []
+    for file_path in _iter_workspace_files(agent, path):
+        rel = file_path.relative_to(agent.root).as_posix()
+        name = file_path.name
+        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
+            matches.append(rel)
+            if len(matches) >= 200:
+                break
+    return "\n".join(matches) or "(no matches)"
+
+
+SYMBOL_FILE_SUFFIXES = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".java", ".kt", ".kts", ".go", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".cs", ".rb", ".php", ".swift", ".scala",
+}
+
+
+def _symbol_kind_for_line(line, query):
+    query_pattern = re.escape(query)
+    patterns = (
+        ("function", rf"^\s*(?:async\s+)?def\s+{query_pattern}\s*\("),
+        ("class", rf"^\s*class\s+{query_pattern}\b"),
+        ("function", rf"^\s*(?:export\s+)?(?:async\s+)?function\s+{query_pattern}\s*\("),
+        ("class", rf"^\s*(?:export\s+)?class\s+{query_pattern}\b"),
+        ("type", rf"^\s*(?:export\s+)?(?:interface|type)\s+{query_pattern}\b"),
+        ("function", rf"^\s*(?:export\s+)?(?:const|let|var)\s+{query_pattern}\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z0-9_,\s]+)\s*=>"),
+        ("definition", rf"^\s*(?:export\s+)?(?:const|let|var)\s+{query_pattern}\b"),
+        ("function", rf"^\s*(?:func|function)\s+{query_pattern}\s*\("),
+        ("type", rf"^\s*type\s+{query_pattern}\b"),
+        ("class", rf"^\s*(?:public\s+)?(?:final\s+)?class\s+{query_pattern}\b"),
+        ("import", rf"^\s*(?:from\s+\S+\s+import\s+.*\b{query_pattern}\b|import\s+.*\b{query_pattern}\b)"),
+    )
+    for kind, pattern in patterns:
+        if re.search(pattern, line):
+            return kind
+    if re.search(rf"\b{query_pattern}\b", line):
+        return "reference"
+    return ""
+
+
+def tool_symbol_search(agent, args):
+    query = str(args.get("query", "")).strip()
+    if not query:
+        raise ValueError("query must not be empty")
+    requested_kind = str(args.get("kind", "")).strip().lower()
+    path = agent.path(args.get("path", "."))
+    matches = []
+    for file_path in _iter_workspace_files(agent, path):
+        if file_path.suffix not in SYMBOL_FILE_SUFFIXES:
+            continue
+        try:
+            if file_path.stat().st_size > 1_000_000:
+                continue
+            lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for number, line in enumerate(lines, start=1):
+            found_kind = _symbol_kind_for_line(line, query)
+            if not found_kind:
+                continue
+            if requested_kind:
+                if requested_kind == "definition" and found_kind == "reference":
+                    continue
+                if requested_kind != "definition" and found_kind != requested_kind:
+                    continue
+            rel = file_path.relative_to(agent.root).as_posix()
+            matches.append(f"{rel}:{number}:{found_kind}:{line.strip()}")
+            if len(matches) >= 200:
+                return "\n".join(matches)
     return "\n".join(matches) or "(no matches)"
 
 
@@ -297,7 +428,7 @@ def tool_write_file(agent, args):
     path = agent.path(args["path"])
     content = str(args["content"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    path.write_text(content, **agent.harness_policy.tool.text_write_kwargs())
     return f"wrote {path.relative_to(agent.root)} ({len(content)} chars)"
 
 
@@ -310,11 +441,11 @@ def tool_patch_file(agent, args):
         raise ValueError("old_text must not be empty")
     if "new_text" not in args:
         raise ValueError("missing new_text")
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(**agent.harness_policy.tool.text_read_kwargs())
     count = text.count(old_text)
     if count != 1:
         raise ValueError(f"old_text must occur exactly once, found {count}")
-    path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
+    path.write_text(text.replace(old_text, str(args["new_text"]), 1), **agent.harness_policy.tool.text_write_kwargs())
     return f"patched {path.relative_to(agent.root)}"
 
 
@@ -353,6 +484,8 @@ _TOOL_RUNNERS = {
     "list_files": tool_list_files,
     "read_file": tool_read_file,
     "search": tool_search,
+    "glob": tool_glob,
+    "symbol_search": tool_symbol_search,
     "web_search": tool_web_search,
     "run_shell": tool_run_shell,
     "write_file": tool_write_file,

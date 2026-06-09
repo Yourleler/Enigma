@@ -2,7 +2,7 @@ import json
 import os
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .evaluator import run_fixed_benchmark
@@ -16,6 +16,10 @@ DEFAULT_CONTEXT_ABLATION_V2_PATH = Path("artifacts/context-ablation-v2.json")
 DEFAULT_MEMORY_ABLATION_V2_PATH = Path("artifacts/memory-ablation-v2.json")
 DEFAULT_RECOVERY_ABLATION_V2_PATH = Path("artifacts/recovery-ablation-v2.json")
 DEFAULT_CORE_REPORT_PATH = Path("docs/metrics/enigma-benchmark-core-report.md")
+
+
+def _utc_timestamp():
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _safe_mean(values):
@@ -1099,7 +1103,7 @@ def collect_resume_metrics(
         "real_provider": real_provider if experiment_mode == "real" else "",
         "facts": {
             "model_backend_count": 2,
-            "tool_count": 7,
+            "tool_count": 10,
             "run_artifact_count": 3,
         },
         "benchmark": benchmark,
@@ -1551,7 +1555,7 @@ def run_context_ablation_v2(artifact_path=DEFAULT_CONTEXT_ABLATION_V2_PATH, repe
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "artifact_type": "context-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "captured_at": _utc_timestamp(),
         "config_count": payload["config_count"],
         "configs": payload["configs"],
         "summary": payload["summary"],
@@ -1564,7 +1568,7 @@ def run_memory_ablation_v2(artifact_path=DEFAULT_MEMORY_ABLATION_V2_PATH, repeti
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "artifact_type": "memory-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "captured_at": _utc_timestamp(),
         "task_count": payload["task_count"],
         "runs_per_variant": payload["runs_per_variant"],
         "category_counts": payload["category_counts"],
@@ -1584,7 +1588,7 @@ def run_recovery_ablation_v2(artifact_path=DEFAULT_RECOVERY_ABLATION_V2_PATH, re
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "artifact_type": "recovery-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
+        "captured_at": _utc_timestamp(),
         "task_count": len(RECOVERY_ABLATION_TASKS),
         "variants": {
             variant: {
@@ -1669,4 +1673,3 @@ def write_benchmark_core_report(
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report_text, encoding="utf-8")
     return report_text
-

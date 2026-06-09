@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from enigma import Skill, build_skill_metadata_block, build_skill_prompt, discover_skills, list_skills
 from enigma.skills import _parse_frontmatter
 

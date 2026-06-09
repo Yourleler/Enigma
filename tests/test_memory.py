@@ -1,4 +1,4 @@
-from enigma.memory import LayeredMemory, summarize_read_result, summarize_shell_result
+from enigma.memory import DurableMemoryStore, LayeredMemory, summarize_read_result, summarize_shell_result
 
 
 def test_working_memory_tracks_summary_and_recent_files():
@@ -201,6 +201,62 @@ def test_durable_memory_index_and_topic_notes_are_loaded_and_retrieved(tmp_path)
 
     lines = [line for line in memory.retrieval_view("constrained tools", limit=4).splitlines() if line.startswith("- ")]
     assert any("Use constrained tools instead of guessing." in line for line in lines)
+
+
+def test_durable_memory_notes_can_store_problem_and_applies_when(tmp_path):
+    memory_root = tmp_path / ".enigma" / "memory"
+    memory_root.mkdir(parents=True)
+    store = DurableMemoryStore(memory_root)
+    store.ensure_index()
+
+    promoted, _ = store.promote(
+        [
+            (
+                "project-conventions",
+                {
+                    "text": "Use harness policy for deterministic encoding rules.",
+                    "problem": "Avoid relying on prompt reminders for UTF-8.",
+                    "applies_when": "When reading or writing text files.",
+                },
+            )
+        ]
+    )
+
+    assert promoted == ["project-conventions: Use harness policy for deterministic encoding rules."]
+    notes = store.load_topic_notes("project-conventions")
+    assert notes[0]["problem"] == "Avoid relying on prompt reminders for UTF-8."
+    assert notes[0]["applies_when"] == "When reading or writing text files."
+
+    text = (memory_root / "topics" / "project-conventions.md").read_text(encoding="utf-8")
+    assert "problem: Avoid relying on prompt reminders for UTF-8." in text
+    assert "applies_when: When reading or writing text files." in text
+
+
+def test_durable_memory_retrieval_uses_applies_when(tmp_path):
+    memory_root = tmp_path / ".enigma" / "memory"
+    memory_root.mkdir(parents=True)
+    store = DurableMemoryStore(memory_root)
+    store.ensure_index()
+    store.promote(
+        [
+            (
+                "project-conventions",
+                {
+                    "text": "Use harness policy for deterministic encoding rules.",
+                    "problem": "Avoid prompt-only control.",
+                    "applies_when": "When reading or writing text files.",
+                },
+            )
+        ]
+    )
+
+    memory = LayeredMemory(workspace_root=tmp_path)
+
+    lines = [line for line in memory.retrieval_view("writing text files", limit=4).splitlines() if line.startswith("- ")]
+    assert any("Use harness policy for deterministic encoding rules." in line for line in lines)
+    assert any("applies_when: When reading or writing text files." in line for line in lines)
+
+    assert memory.retrieval_candidates("database migration", limit=4) == []
 
 
 def test_promote_respects_topic_note_limit(tmp_path):

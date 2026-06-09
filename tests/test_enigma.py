@@ -168,6 +168,25 @@ def test_agent_retries_after_malformed_tool_payload(tmp_path):
     assert any("valid <tool> call" in item for item in notices)
 
 
+def test_parse_repairs_extra_trailing_tool_json_brace():
+    kind, payload = MiniAgent.parse(
+        '<tool>{"name":"read_file","args":{"path":"README.md"}}}</tool>'
+    )
+
+    assert kind == "tool"
+    assert payload["name"] == "read_file"
+    assert payload["args"] == {"path": "README.md"}
+
+
+def test_parse_still_retries_other_malformed_tool_json():
+    kind, payload = MiniAgent.parse(
+        '<tool>{"name":"read_file","args":{"path":"README.md"}</tool>'
+    )
+
+    assert kind == "retry"
+    assert "malformed tool JSON" in payload
+
+
 def test_agent_accepts_xml_write_file_tool(tmp_path):
     agent = build_agent(
         tmp_path,
@@ -275,6 +294,36 @@ def test_list_files_hides_internal_agent_state(tmp_path):
     assert "[F] hello.txt" in result
 
 
+def test_glob_finds_workspace_files_without_internal_state(tmp_path):
+    agent = build_agent(tmp_path, [])
+    (tmp_path / "enigma").mkdir(exist_ok=True)
+    (tmp_path / "enigma" / "runtime.py").write_text("def ask():\n    pass\n", encoding="utf-8")
+    (tmp_path / ".enigma").mkdir(exist_ok=True)
+    (tmp_path / ".enigma" / "hidden.py").write_text("secret\n", encoding="utf-8")
+
+    result = agent.run_tool("glob", {"pattern": "**/*.py", "path": "."})
+
+    assert "enigma/runtime.py" in result
+    assert ".enigma/hidden.py" not in result
+
+
+def test_symbol_search_finds_definitions_and_references(tmp_path):
+    agent = build_agent(tmp_path, [])
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "app.py").write_text(
+        "def build_agent(args):\n"
+        "    return args\n\n"
+        "value = build_agent({})\n",
+        encoding="utf-8",
+    )
+
+    definitions = agent.run_tool("symbol_search", {"query": "build_agent", "kind": "definition", "path": "src"})
+    references = agent.run_tool("symbol_search", {"query": "build_agent", "kind": "reference", "path": "src"})
+
+    assert "src/app.py:1:function:def build_agent(args):" in definitions
+    assert "src/app.py:4:reference:value = build_agent({})" in references
+
+
 def test_repeated_identical_tool_call_is_rejected(tmp_path):
     agent = build_agent(tmp_path, [])
     agent.append_session_history({"role": "tool", "name": "list_files", "args": {}, "content": "(empty)", "created_at": "1"})
@@ -293,6 +342,17 @@ def test_web_search_is_advertised_in_prompt(tmp_path):
     assert "- web_search(" in prompt
     assert "Use web_search for current information" in prompt
     assert "include source URLs" in prompt
+
+
+def test_prompt_includes_coding_tool_loop(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    prompt = agent.prompt("Change the implementation")
+
+    assert "search/list/glob to locate relevant files" in prompt
+    assert "run focused tests or checks with run_shell" in prompt
+    assert "- glob(" in prompt
+    assert "- symbol_search(" in prompt
 
 
 def test_web_search_rejects_invalid_arguments(tmp_path):
@@ -2104,4 +2164,3 @@ def test_module_execution_help_works():
 
     assert result.returncode == 0
     assert "usage:" in result.stdout.lower()
-

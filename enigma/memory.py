@@ -6,6 +6,7 @@ session history 负责保存完整事件流；这个模块只保存更小的一�
 """
 
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import math
@@ -60,6 +61,44 @@ DURABLE_TOPIC_DEFAULTS = {
         "tags": ["preference"],
     },
 }
+
+
+@dataclass(frozen=True)
+class MemoryNote:
+    text: str
+    topic: str = ""
+    problem: str = ""
+    applies_when: str = ""
+
+    @classmethod
+    def from_value(cls, value, topic=""):
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(
+                text=clip(str(value.get("text", "")).strip(), 500),
+                topic=str(value.get("topic", topic)).strip(),
+                problem=clip(str(value.get("problem", "")).strip(), 300),
+                applies_when=clip(str(value.get("applies_when", "")).strip(), 300),
+            )
+        return cls(text=clip(str(value).strip(), 500), topic=str(topic).strip())
+
+    def to_dict(self):
+        payload = {
+            "text": self.text,
+            "topic": self.topic,
+            "problem": self.problem,
+            "applies_when": self.applies_when,
+        }
+        return {key: value for key, value in payload.items() if str(value).strip()}
+
+    def render(self):
+        pieces = [self.text]
+        if self.problem:
+            pieces.append(f"problem: {self.problem}")
+        if self.applies_when:
+            pieces.append(f"applies_when: {self.applies_when}")
+        return " | ".join(pieces)
 
 
 def default_memory_state():
@@ -145,6 +184,7 @@ class DurableMemoryStore:
         capture = False
         updated_at = ""
         tags = []
+        current = None
         for raw in lines:
             line = raw.strip()
             if line.startswith("- tags:"):
@@ -154,15 +194,21 @@ class DurableMemoryStore:
             elif line == "## Notes":
                 capture = True
             elif capture and line.startswith("- "):
-                notes.append(
-                    {
-                        "text": line[2:].strip(),
-                        "tags": tags,
-                        "source": topic,
-                        "created_at": updated_at or now(),
-                        "kind": "durable",
-                    }
-                )
+                current = {
+                    "text": line[2:].strip(),
+                    "topic": topic,
+                    "problem": "",
+                    "applies_when": "",
+                    "tags": tags,
+                    "source": topic,
+                    "created_at": updated_at or now(),
+                    "kind": "durable",
+                }
+                notes.append(current)
+            elif capture and current is not None and line.startswith("problem:"):
+                current["problem"] = line.split(":", 1)[1].strip()
+            elif capture and current is not None and line.startswith("applies_when:"):
+                current["applies_when"] = line.split(":", 1)[1].strip()
         return notes
 
     @staticmethod
@@ -214,18 +260,33 @@ class DurableMemoryStore:
             "",
             "## Notes",
         ]
-        for note in notes:
-            lines.append(f"- {note}")
+        for raw_note in notes:
+            note = MemoryNote.from_value(raw_note, topic=topic)
+            if not note.text:
+                continue
+            lines.append(f"- {note.text}")
+            if note.problem:
+                lines.append(f"  problem: {note.problem}")
+            if note.applies_when:
+                lines.append(f"  applies_when: {note.applies_when}")
         (self.topics_dir / f"{topic}.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
     def promote(self, promotions):
         if not promotions:
             return [], []
         topics = {topic["topic"]: topic for topic in self.load_index()}
-        topic_notes = {slug: [note["text"] for note in self.load_topic_notes(slug)] for slug in topics}
+        topic_notes = {slug: [MemoryNote.from_value(note, topic=slug).to_dict() for note in self.load_topic_notes(slug)] for slug in topics}
         results = []
         superseded = []
-        for topic, note_text in promotions:
+        for item in promotions:
+            if len(item) == 2:
+                topic, raw_note = item
+            else:
+                topic, raw_note = item[0], item[1]
+            note = MemoryNote.from_value(raw_note, topic=topic)
+            note_text = note.text
+            if not note_text:
+                continue
             meta = DURABLE_TOPIC_DEFAULTS[topic]
             topics.setdefault(
                 topic,
@@ -237,21 +298,22 @@ class DurableMemoryStore:
                 },
             )
             existing = topic_notes.setdefault(topic, [])
-            if note_text in existing:
+            if note_text in [MemoryNote.from_value(item, topic=topic).text for item in existing]:
                 continue
             new_subject = self._subject_key(note_text)
             replaced = False
             if new_subject:
                 for index, old_text in enumerate(list(existing)):
-                    if self._subject_key(old_text) == new_subject:
-                        superseded.append(f"{topic}: {old_text} -> {note_text}")
-                        existing[index] = note_text
+                    old_note = MemoryNote.from_value(old_text, topic=topic)
+                    if self._subject_key(old_note.text) == new_subject:
+                        superseded.append(f"{topic}: {old_note.text} -> {note_text}")
+                        existing[index] = note.to_dict()
                         replaced = True
                         break
             if not replaced:
                 if len(existing) >= TOPIC_NOTE_LIMIT:
                     continue
-                existing.append(note_text)
+                existing.append(note.to_dict())
             results.append(f"{topic}: {note_text}")
         self._write_index([topics[slug] for slug in sorted(topics)])
         for topic, notes in topic_notes.items():
@@ -275,13 +337,14 @@ class DurableMemoryStore:
             }
             cleaned = []
             seen = set()
-            for note in notes:
-                text = clip(str(note).strip(), 500)
+            for raw_note in notes:
+                note = MemoryNote.from_value(raw_note, topic=topic)
+                text = note.text
                 key = text.lower()
                 if not text or key in seen:
                     continue
                 seen.add(key)
-                cleaned.append(text)
+                cleaned.append(note.to_dict())
             self._write_topic(topic, cleaned[:TOPIC_NOTE_LIMIT])
             replaced.append(topic)
         self._write_index([topics[slug] for slug in sorted(topics)])
@@ -355,6 +418,8 @@ def _note_search_terms(note, extra_text=""):
     tags = [str(tag).strip() for tag in _ensure_list(note.get("tags", [])) if str(tag).strip()]
     return (
         _tokenize_terms(note.get("text", ""))
+        + _tokenize_terms(note.get("problem", ""))
+        + _tokenize_terms(note.get("applies_when", ""))
         + _tokenize_terms(note.get("source", ""))
         + _tokenize_terms(extra_text)
         + [token for tag in tags for token in _tokenize_terms(tag)]
@@ -781,7 +846,7 @@ def retrieval_view(state, query, limit=3, workspace_root=None):
         lines.append("- none")
         return "\n".join(lines)
     for note in candidates:
-        lines.append(f"- {note['text']}")
+        lines.append(f"- {MemoryNote.from_value(note).render()}")
     return "\n".join(lines)
 
 

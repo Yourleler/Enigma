@@ -20,6 +20,8 @@ from . import memory as memorylib
 from . import display as displaymod
 from .context_manager import ContextManager, estimate_tokens
 from .models import should_compact
+from .orchestration import Orchestrator
+from .policy import HarnessPolicy
 from .run_store import RunStore
 from .skills import build_skill_metadata_block
 from .storage import SessionDB
@@ -203,6 +205,7 @@ class Enigma:
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
+        self.harness_policy = HarnessPolicy.default()
 
         # run_store 负责保存单次 ask 运行产物；没有传入时放到仓库的 .enigma/runs 下。
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".enigma" / "runs")
@@ -505,8 +508,10 @@ class Enigma:
             examples = "\n".join(
                 [
                     '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+                    '<tool>{"name":"glob","args":{"pattern":"**/*.py","path":"."}}</tool>',
                     '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
                     '<tool>{"name":"search","args":{"pattern":"def main","path":"."}}</tool>',
+                    '<tool>{"name":"symbol_search","args":{"query":"main","kind":"definition","path":"."}}</tool>',
                     '<tool>{"name":"web_search","args":{"query":"Python asyncio best practices","max_results":5}}</tool>',
                     '<plan>\n## Goal\nAdd a --version flag to the CLI\n\n## Files to modify\n- cli.py: add --version argument\n- __init__.py: export __version__\n\n## Steps\n1. ...\n</plan>',
                 ]
@@ -522,6 +527,7 @@ class Enigma:
                   <tool>{{"name":"tool_name","args":{{...}}}}</tool>
                 - Focus on understanding the user's request and the code associated with their request.
                 - Actively search for existing functions, utilities, and patterns that can be reused.
+                - For code exploration, prefer this read-only loop: glob/list to locate files, search or symbol_search to narrow targets, read the relevant ranges, then reason about the plan.
                 - Explore enough to answer: what files need to change, what existing code to reuse, what risks exist. Stop exploring once these are clear.
                 - When ready, output your plan as:
                   <plan>
@@ -543,6 +549,8 @@ class Enigma:
                 Tools:
                 {tool_text}
 
+                {self.harness_policy.render_prompt_block()}
+
                 Valid response examples:
                 {examples}
 
@@ -550,18 +558,7 @@ class Enigma:
                 """
             ).strip()
         else:
-            examples = "\n".join(
-                [
-                    '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
-                    '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
-                    '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
-                    '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
-                    '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-                    '<tool>{"name":"web_search","args":{"query":"Python asyncio best practices","max_results":5}}</tool>',
-                    '<tool>{"message":"Delegating investigation to a sub-agent.","name":"delegate","args":{"task":"inspect how auth is wired in this repo","max_steps":3}}</tool>',
-                    "<final>Done.</final>",
-                ]
-            )
+            examples = self.tool_examples_for_current_surface()
             # prefix 可以理解成 agent 的"工作手册"：
             # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
             plan_path = self._get_plan_path()
@@ -580,32 +577,34 @@ class Enigma:
 
                 Rules:
                 - Use tools instead of guessing about the workspace.
+                {self.coding_loop_rule_text()}
                 - Return exactly one <tool>...</tool> or one <final>...</final>.
                 - Tool calls must look like:
                   <tool>{{"name":"tool_name","args":{{...}}}}</tool>
                 - Tool calls may include a brief user-facing message:
                   <tool>{{"message":"I will inspect the file first.","name":"read_file","args":{{"path":"README.md"}}}}</tool>
-                - For write_file and patch_file with multi-line text, prefer XML style:
-                  <tool name="write_file" path="file.py"><content>...</content></tool>
+                {self.write_tool_rule_text()}
                 - Final answers must look like:
                   <final>your answer</final>
                 - Never invent tool results.
                 - Keep answers concise and concrete.
-                - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
+                {self.direct_file_update_rule_text()}
                 - Use web_search for current information, news, prices, latest versions, or external documentation changes.
                 - When answering from web_search results, include source URLs and mention conflicts between sources if they matter.
                 - Before writing tests for existing code, read the implementation first.
                 - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
                 - New files should be complete and runnable, including obvious imports.
-                - Use delegate to investigate complex questions in isolation (e.g. "how is auth wired?", "what does this module do?"). The child agent is read-only and returns a summary. Prefer delegate over long manual exploration when the question is broad.
+                {self.delegate_rule_text()}
                 - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
-                - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, web_search, or delegate with args={{}}.
+                - Required tool arguments must not be empty. Do not call available tools with args={{}}.
                 - When "启动记忆 (MEMORY.md)" appears, treat it as stable cross-session facts; do not restate them to the user unless asked.
                 - When "会话滚动摘要" appears, it is the compressed state of earlier turns; continue the task from that state instead of restarting.
                 - Skills listed below are user-invocable via /<name>. When the user types /<name>, follow the skill's instructions.{plan_hint}{skill_block}
 
                 Tools:
                 {tool_text}
+
+                {self.harness_policy.render_prompt_block()}
 
                 Valid response examples:
                 {examples}
@@ -620,6 +619,40 @@ class Enigma:
             tool_signature=self.tool_signature(),
             built_at=now(),
         )
+
+    def tool_examples_for_current_surface(self):
+        examples = []
+        for name in ("list_files", "glob", "read_file", "search", "symbol_search", "write_file", "patch_file", "run_shell", "web_search", "delegate"):
+            if name not in self.tools:
+                continue
+            example = self.tool_example(name)
+            if example:
+                examples.append(example)
+        examples.append("<final>Done.</final>")
+        return "\n".join(examples)
+
+    def write_tool_rule_text(self):
+        if "write_file" in self.tools or "patch_file" in self.tools:
+            return (
+                "- For write_file and patch_file with multi-line text, prefer XML style:\n"
+                '  <tool name="write_file" path="file.py"><content>...</content></tool>'
+            )
+        return "- This role has no file-writing tools; inspect and report findings only."
+
+    def coding_loop_rule_text(self):
+        if {"write_file", "patch_file", "run_shell"} & set(self.tools):
+            return "- For coding changes, follow this loop when applicable: search/list/glob to locate relevant files, read before reasoning, edit with write_file or patch_file, run focused tests or checks with run_shell, observe failures or diffs, then revise or finalize."
+        return "- For read-only code work, follow this loop when applicable: search/list/glob to locate relevant files, use symbol_search or search to narrow targets, read relevant ranges, reason from observed code, then report concrete findings."
+
+    def direct_file_update_rule_text(self):
+        if "write_file" in self.tools or "patch_file" in self.tools:
+            return "- If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files."
+        return "- If a change is needed but no write tool is available, explain the needed change instead of attempting to modify files."
+
+    def delegate_rule_text(self):
+        if "delegate" in self.tools:
+            return '- Use delegate to investigate complex questions in isolation (e.g. "how is auth wired?", "what does this module do?"). The child agent is read-only and returns a summary. Prefer delegate over long manual exploration when the question is broad.'
+        return "- Delegate is not available in this role; perform only the investigation allowed by the listed tools."
 
     def _apply_prefix_state(self, prefix_state):
         self.prefix_state = prefix_state
@@ -1482,13 +1515,14 @@ class Enigma:
                 continue
             cleaned = []
             for note in notes:
-                note_text = str(note).strip()
+                memory_note = memorylib.MemoryNote.from_value(note, topic=topic)
+                note_text = memory_note.text
                 if not note_text:
                     continue
                 reason = self.reject_durable_reason(note_text)
                 if reason:
                     continue
-                cleaned.append(note_text)
+                cleaned.append(memory_note.to_dict())
             if cleaned:
                 validated[topic] = cleaned
         return validated
@@ -1587,6 +1621,7 @@ class Enigma:
         self._last_preview_lines = 0
         self._last_result_compact = ""
         self._last_preview_header_printed = False
+        self._report_prompt_metadata = None
 
         # 这是 agent 的主循环，可以按"感知 -> 决策 -> 行动 -> 记录"来理解：
         # 1. 感知：重新组 prompt，把当前状态整理给模型看
@@ -1617,6 +1652,8 @@ class Enigma:
                     "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
                 },
             )
+            if self._report_prompt_metadata is None:
+                self._report_prompt_metadata = dict(prompt_metadata)
 
             # 如果恢复的 checkpoint 和当前工作区状态不一致，就先创建新 checkpoint，
             # 避免模型在旧上下文上继续做有风险的推理。
@@ -2078,6 +2115,12 @@ class Enigma:
         if name == "search":
             pattern = str((args or {}).get("pattern", "")).strip()
             return clip(f"Searching the workspace for {pattern}.", 160) if pattern else "Searching the workspace."
+        if name == "glob":
+            pattern = str((args or {}).get("pattern", "")).strip()
+            return clip(f"Finding files matching {pattern}.", 160) if pattern else "Finding files."
+        if name == "symbol_search":
+            query = str((args or {}).get("query", "")).strip()
+            return clip(f"Searching symbols for {query}.", 160) if query else "Searching symbols."
         if name == "list_files":
             path = str((args or {}).get("path", ".")).strip() or "."
             return f"Listing files in {path}."
@@ -2127,7 +2170,7 @@ class Enigma:
         if prev_lines > 0 and self._last_preview_header_printed:
             move_up = prev_lines
             for i in range(move_up):
-                print(f"\033[A\033[2K", end="", file=stream)
+                print("\033[A\033[2K", end="", file=stream)
             if self._last_result_compact:
                 compact_text = self._last_result_compact
                 if use_color:
@@ -2244,6 +2287,10 @@ class Enigma:
             return Enigma._format_summary_arg("path", args.get("path", ""))
         if name == "search":
             return Enigma._format_summary_arg("pattern", args.get("pattern", ""))
+        if name == "glob":
+            return Enigma._format_summary_arg("pattern", args.get("pattern", ""))
+        if name == "symbol_search":
+            return Enigma._format_summary_arg("query", args.get("query", ""))
         if name == "list_files":
             return Enigma._format_summary_arg("path", args.get("path", "."))
         if name == "run_shell":
@@ -2279,12 +2326,16 @@ class Enigma:
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
             "task_state": task_state.to_dict(),
-            "prompt_metadata": self.last_prompt_metadata,
+            "prompt_metadata": self._report_prompt_metadata or self.last_prompt_metadata,
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
             "redacted_env": self.detected_secret_env_summary(),
         }
+
+    def orchestrate(self, task, retry_limit=2):
+        orchestrator = Orchestrator(self, retry_limit=retry_limit)
+        return orchestrator.run_task(task)
 
     def tool_example(self, name):
         return toolkit.tool_example(name)
@@ -2304,6 +2355,12 @@ class Enigma:
 
     def tool_search(self, args):
         return toolkit.tool_search(self, args)
+
+    def tool_glob(self, args):
+        return toolkit.tool_glob(self, args)
+
+    def tool_symbol_search(self, args):
+        return toolkit.tool_symbol_search(self, args)
 
     def tool_web_search(self, args):
         return toolkit.tool_web_search(self, args)
@@ -2394,7 +2451,9 @@ class Enigma:
             try:
                 payload = json.loads(body)
             except Exception:
-                return "retry", Enigma.retry_notice("model returned malformed tool JSON")
+                payload = Enigma.parse_tool_json_with_trailing_brace_repair(body)
+                if payload is None:
+                    return "retry", Enigma.retry_notice("model returned malformed tool JSON")
             if not isinstance(payload, dict):
                 return "retry", Enigma.retry_notice("tool payload must be a JSON object")
             if not str(payload.get("name", "")).strip():
@@ -2438,6 +2497,22 @@ class Enigma:
             f"{prefix}. Reply with a valid <tool> call or a non-empty <final> answer. "
             'For multi-line files, prefer <tool name="write_file" path="file.py"><content>...</content></tool>.'
         )
+
+    @staticmethod
+    def parse_tool_json_with_trailing_brace_repair(body):
+        body = str(body or "").strip()
+        if not body.startswith("{") or not body.endswith("}"):
+            return None
+        candidate = body
+        for _ in range(2):
+            if not candidate.endswith("}}"):
+                return None
+            candidate = candidate[:-1].rstrip()
+            try:
+                return json.loads(candidate)
+            except Exception:
+                continue
+        return None
 
     @staticmethod
     def parse_xml_tool(raw):

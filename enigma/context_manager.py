@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .memory import MemoryNote
+
 
 def estimate_tokens(text):
     """估算文本的 token 数。中英混合约 3.5 字符/token。"""
@@ -252,7 +254,7 @@ class ContextManager:
         selected_notes = selected_notes or []
         relevant_lines = ["召回记忆:"]
         if selected_notes:
-            relevant_lines.extend(f"- {note['text']}" for note in selected_notes)
+            relevant_lines.extend(f"- {MemoryNote.from_value(note).render()}" for note in selected_notes)
         else:
             relevant_lines.append("- none")
         relevant_raw = "\n".join(relevant_lines)
@@ -340,7 +342,8 @@ class ContextManager:
     def _render_relevant_memory(self, selected_notes, budget):
         header = "召回记忆:"
         note_texts = [str(note.get("text", "")) for note in selected_notes if str(note.get("text", "")).strip()]
-        raw_lines = [header] + [f"- {text}" for text in note_texts]
+        note_render_texts = [MemoryNote.from_value(note).render() for note in selected_notes if str(note.get("text", "")).strip()]
+        raw_lines = [header] + [f"- {text}" for text in note_render_texts]
         raw = "\n".join(raw_lines) if note_texts else "\n".join([header, "- none"])
         if not note_texts:
             rendered = raw
@@ -362,7 +365,7 @@ class ContextManager:
         while True:
             # 让每条 note 平分这一段的预算，避免一条超长笔记把其他笔记都挤掉。
             char_limit = tokens_to_chars(per_note_budget)
-            rendered_notes = [_tail_clip(text, char_limit) for text in note_texts]
+            rendered_notes = [_tail_clip(text, char_limit) for text in note_render_texts]
             rendered = "\n".join([header] + [f"- {text}" for text in rendered_notes])
             if estimate_tokens(rendered) <= budget or per_note_budget <= 1:
                 break
@@ -588,6 +591,8 @@ class ContextManager:
                 "selected_notes": [note["text"] for note in selected_notes],
                 "selected_sources": [str(note.get("source", "")).strip() for note in selected_notes],
                 "selected_kinds": [str(note.get("kind", "episodic")).strip() or "episodic" for note in selected_notes],
+                "selected_problems": [str(note.get("problem", "")).strip() for note in selected_notes],
+                "selected_applies_when": [str(note.get("applies_when", "")).strip() for note in selected_notes],
                 "selected_durable_count": sum(
                     1 for note in selected_notes if (str(note.get("kind", "episodic")).strip() or "episodic") == "durable"
                 ),

@@ -18,8 +18,8 @@ dev = [
   "ruff>=0.4.4",
 ]
 
-[tool.setuptools]
-packages = ["enigma"]
+[tool.setuptools.packages.find]
+include = ["enigma*"]
 
 [tool.setuptools.package-data]
 enigma = ["skills/*.md"]

@@ -1,8 +1,7 @@
 """Plan mode 测试：plan 标签解析、工具过滤、审批流程、plan → execute 完整链路。"""
 
-import pytest
-
 from enigma import FakeModelClient, MiniAgent, PlanResult, SessionStore, WorkspaceContext
+from enigma.cli import handle_builtin_command
 from enigma.runtime import PLAN_FILE_NAME
 
 
@@ -76,9 +75,9 @@ class TestPlanModeToolFiltering:
         assert "patch_file" in tool_names
         assert "run_shell" in tool_names
 
-    def test_plan_mode_delegate_still_available(self, tmp_path):
+    def test_plan_mode_hides_delegate_because_it_is_risky(self, tmp_path):
         agent = build_agent(tmp_path, [], plan_mode=True, max_depth=2)
-        assert "delegate" in agent.tools
+        assert "delegate" not in agent.tools
 
 
 class TestPlanModePrefix:
@@ -169,6 +168,21 @@ class TestExitPlanMode:
 
 
 class TestPlanThenExecute:
+    def test_plan_command_restores_normal_mode_after_reject(self, tmp_path, monkeypatch):
+        agent = build_agent(
+            tmp_path,
+            ["This is my plan: inspect README.md"],
+            plan_mode=False,
+        )
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "3")
+
+        handled = handle_builtin_command(agent, "/plan inspect README.md")
+
+        assert handled is True
+        assert agent.plan_mode is False
+        assert "write_file" in agent.tools
+        assert "PLAN MODE" not in agent.prefix
+
     def test_full_plan_then_execute_flow(self, tmp_path):
         (tmp_path / "hello.txt").write_text("original\n", encoding="utf-8")
         agent = build_agent(
@@ -194,15 +208,15 @@ class TestPlanThenExecute:
 
 
 class TestPlanModeNotInheritedByDelegate:
-    def test_delegate_tools_unaffected_by_parent_plan_mode(self, tmp_path):
+    def test_normal_mode_delegate_still_available(self, tmp_path):
         agent = build_agent(tmp_path, [], plan_mode=True, max_depth=2)
+        assert "delegate" not in agent.tools
+        agent.plan_mode = False
+        agent.tools = agent.build_tools()
         assert "delegate" in agent.tools
-        # The delegate tool's child agent is created at runtime,
-        # but the parent's plan_mode should not be passed to it.
-        # We verify by checking that the delegate tool spec itself
-        # doesn't have plan_mode baked in.
         delegate_spec = agent.tools["delegate"]
         assert "run" in delegate_spec
+        assert delegate_spec["risky"] is True
 
 
 class TestPlanModeRuntimeIdentity:

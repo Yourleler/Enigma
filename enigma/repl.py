@@ -103,8 +103,6 @@ def _read_key_windows():
 def _read_key_unix():
     try:
         import select
-        import tty
-        import termios
         if select.select([sys.stdin], [], [], 0)[0]:
             ch = sys.stdin.read(1)
             return ch

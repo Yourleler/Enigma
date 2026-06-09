@@ -58,6 +58,27 @@ def test_risky_tool_deny_behavior(tmp_path):
     assert result == "error: approval denied for run_shell"
 
 
+def test_harness_policy_drives_utf8_text_file_tools(tmp_path):
+    raw = b"alpha\n\xff\n"
+    (tmp_path / "bad.txt").write_bytes(raw)
+    agent = build_agent(tmp_path, [], approval_policy="auto")
+
+    result = agent.run_tool("read_file", {"path": "bad.txt", "start": 1, "end": 3})
+
+    assert "alpha" in result
+    assert "\ufffd" in result
+    assert agent.harness_policy.tool.text_encoding == "utf-8"
+
+
+def test_delegate_is_risky_and_approval_controlled(tmp_path):
+    agent = build_agent(tmp_path, [], approval_policy="never", max_depth=2)
+
+    assert agent.tools["delegate"]["risky"] is True
+    result = agent.run_tool("delegate", {"task": "inspect README.md", "max_steps": 1})
+
+    assert result == "error: approval denied for delegate"
+
+
 def test_cli_build_agent_wires_secret_env_names_from_parser(tmp_path):
     class DummyModelClient:
         def __init__(self, *args, **kwargs):

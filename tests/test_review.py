@@ -1,9 +1,6 @@
 """workspace.py 和 /review 命令的测试。"""
 
-from pathlib import Path
 from unittest.mock import patch
-
-import pytest
 
 from enigma import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
 from enigma.cli import handle_builtin_command, _build_review_prompt

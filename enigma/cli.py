@@ -14,7 +14,6 @@ import textwrap
 import threading
 
 from . import repl
-from .context_manager import DEFAULT_TOTAL_BUDGET
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient, get_context_window
 from .runtime import Enigma, PlanResult, SessionStore
 from .skills import build_skill_prompt, discover_skills, list_skills
@@ -48,6 +47,7 @@ HELP_DETAILS = textwrap.dedent(
     /session Show the path to the saved session file.
     /reset   Clear the current session history and memory.
     /plan <task>  Enter plan mode: explore read-only, produce a plan.
+    /orchestrate <task>  Run bounded Plan/Execute/Review/Repair orchestration.
     /review [target]  Review changes: PR link, branch, files, or auto-detect.
     /skills  List available skills.
     /<skill-name> [args]  Invoke a skill (e.g. /test-writer auth.py).
@@ -601,10 +601,22 @@ def handle_builtin_command(agent, user_input):
                 print(result)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
-            agent.plan_mode = prev_plan_mode
-            agent.tools = agent.build_tools()
-            agent.prefix_state = agent.build_prefix()
-            agent.prefix = agent.prefix_state.text
+        finally:
+            if agent.plan_mode:
+                agent.plan_mode = prev_plan_mode
+                agent.tools = agent.build_tools()
+                agent.prefix_state = agent.build_prefix()
+                agent.prefix = agent.prefix_state.text
+        return True
+    if user_input.startswith("/orchestrate "):
+        task = user_input[len("/orchestrate "):].strip()
+        if not task:
+            print("Usage: /orchestrate <task description>")
+            return True
+        try:
+            print(agent.orchestrate(task))
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
         return True
     if user_input == "/review" or user_input.startswith("/review "):
         _handle_review(agent, user_input[len("/review"):].strip())

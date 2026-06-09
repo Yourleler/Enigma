@@ -40,6 +40,7 @@ artifacts/
 readme_intro_locked/
 
 # Local/private machine metadata
+start-enigma-local.txt
 folder-alias.json
 private-folder-alias.json
 .claude/
@@ -52,3 +53,5 @@ Thumbs.db
 *.swp
 *.swo
 *~
+孟维汉大模型岗位求职面试记录.docx
+孟维汉大模型岗位求职面试记录.m4a

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from enigma.memory import DurableMemoryStore, LayeredMemory
 from enigma.storage import SessionDB
 

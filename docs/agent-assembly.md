@@ -241,8 +241,9 @@ __init__(model_client, workspace, session_store, ...)
   │
   ├─ 工具注册
   │   build_tools() → toolkit.build_tool_registry(self)
-  │   正常模式：7 个工具（list_files, read_file, search, run_shell,
-  │   write_file, patch_file, delegate）
+  │   正常模式：9 个基础工具 + delegate 条件注册
+  │   （list_files, glob, read_file, search, symbol_search, web_search,
+  │   run_shell, write_file, patch_file, delegate）
   │   Plan 模式：过滤掉 risky 工具，只保留只读工具
   │
   ├─ Prompt 前缀构建
@@ -355,7 +356,7 @@ enigma --provider ollama "fix the bug"
   │
   └─ Enigma(model_client, workspace, session_store, ...)
       ├─ LayeredMemory（分层记忆）
-      ├─ ToolRegistry（7 个工具，Plan 模式下过滤为只读）
+      ├─ ToolRegistry（9 个基础工具 + delegate，Plan 模式下过滤为只读）
       ├─ PromptPrefix（工作手册 + 工作区快照）
       ├─ ContextManager（prompt 预算组装器）
       └─ evaluate_resume_state()（检查点状态评估）
@@ -590,18 +591,20 @@ raw 模型输出
 返回 result（字符串）给主循环
 ```
 
-**工具白名单**（`tools.py`）共 8 个工具（7 个基础 + 1 个条件注册）：
+**工具白名单**（`tools.py`）共 10 个工具（9 个基础 + 1 个条件注册）：
 
 | 工具 | risky | 说明 |
 |------|-------|------|
 | `list_files` | No | 列出目录文件 |
 | `read_file` | No | 读取文件内容（按行范围） |
 | `search` | No | rg 搜索（降级到 grep） |
+| `glob` | No | 按 glob pattern 定位文件 |
+| `symbol_search` | No | 轻量查定义、类型和引用 |
 | `web_search` | No | 联网搜索，支持域名过滤 |
 | `run_shell` | **Yes** | 执行 shell 命令 |
 | `write_file` | **Yes** | 写入文件 |
 | `patch_file` | **Yes** | 精确文本替换 |
-| `delegate` | No | 委派只读子 agent（条件注册） |
+| `delegate` | **Yes** | 委派只读子 agent（条件注册，但会扩大模型调用范围） |
 
 **路径穿越防护**：所有文件类工具调用 `Enigma.path()`（`runtime.py:1338`），它把相对路径锚定在 `repo_root` 下，然后用 `os.path.commonpath()` 检查解析后的路径是否还在仓库内。符号链接解析后跳出仓库也会被拦截。
 
@@ -941,30 +944,34 @@ def build_tool_registry(agent):
 
 ### 3.2 工具清单
 
-当前共 8 个工具（7 个基础 + 1 个条件注册）：
+当前共 10 个工具（9 个基础 + 1 个条件注册）：
 
 | 工具 | risky | 参数 | 说明 |
 |------|-------|------|------|
 | `list_files` | No | `path='.'` | 列出目录下的文件和子目录，跳过 `.git`、`__pycache__` 等忽略项，上限 200 条 |
 | `read_file` | No | `path, start=1, end=200` | 按行范围读取 UTF-8 文件，输出带行号 |
 | `search` | No | `pattern, path='.'` | 优先用 `rg`（ripgrep）搜索，找不到则回退到 Python 纯文本搜索 |
+| `glob` | No | `pattern, path='.'` | 按 glob pattern 返回工作区内匹配文件，跳过 `.git` / `.enigma` 等内部目录 |
+| `symbol_search` | No | `query, path='.', kind=''` | 用轻量源码模式查定义、函数、类、类型、import 或引用，不启动完整 LSP |
 | `web_search` | No | `query, max_results=5, allowed_domains='', blocked_domains=''` | 联网搜索，返回带来源的结果片段 |
 | `run_shell` | **Yes** | `command, timeout=20` | 在仓库根目录执行 shell 命令，使用过滤后的环境变量 |
 | `write_file` | **Yes** | `path, content` | 写入文本文件，自动创建父目录 |
 | `patch_file` | **Yes** | `path, old_text, new_text` | 精确文本替换，`old_text` 必须在文件中恰好出现一次 |
-| `delegate` | No | `task, max_steps=3` | 委派只读子 agent 调查任务（条件注册） |
+| `delegate` | **Yes** | `task, max_steps=3` | 委派只读子 agent 调查任务（条件注册，但会扩大模型调用范围） |
 
 `risky=True` 的工具需要经过审批流程（见 3.5 节），并且在执行前后会采集工作区快照对比。
 
-**Plan 模式下**，`build_tools()` 过滤掉所有 `risky=True` 的工具，只保留 `list_files`、`read_file`、`search`、`web_search` 和 `delegate`。delegate 子 agent 不继承父 agent 的 `plan_mode` 状态。
+**Plan 模式下**，`build_tools()` 过滤掉所有 `risky=True` 的工具，只保留 `list_files`、`glob`、`read_file`、`search`、`symbol_search`、`web_search` 等只读工具。delegate 被视为 risky，因为它会扩大模型调用和任务范围。
 
 ### 3.3 参数校验机制
 
 `validate_tool()`（`tools.py:89`）在 `run_tool()` 流水线的第二阶段被调用。它为每个工具定义了独立的校验规则：
 
-- **路径类工具**（`list_files`、`read_file`、`write_file`、`patch_file`）：通过 `agent.path()` 解析路径并做穿越检查（见 3.6 节）
+- **路径类工具**（`list_files`、`glob`、`read_file`、`search`、`symbol_search`、`write_file`、`patch_file`）：通过 `agent.path()` 解析路径并做穿越检查（见 3.6 节）
 - **`read_file`**：额外校验 `start >= 1` 且 `end >= start`
 - **`search`**：`pattern` 不能为空
+- **`glob`**：`pattern` 不能为空且长度受限
+- **`symbol_search`**：`query` 不能为空；`kind` 只能是 definition / function / class / type / import / reference 等受控值
 - **`web_search`**：`query` 不能为空且不超过 300 字符；`max_results` 必须在 `[1, 10]` 范围内
 - **`run_shell`**：`command` 不能为空；`timeout` 必须在 `[1, 120]` 秒范围内
 - **`patch_file`**：除了路径检查外，还会读取文件内容验证 `old_text` 是否恰好出现一次——这是刻意的严格设计，确保修改行为是确定性的：
@@ -998,6 +1005,8 @@ if name == "patch_file":
 | `list_files` | 先文件后目录排序，跳过 `.git`/`__pycache__` 等噪音，上限 200 条，路径相对仓库根 |
 | `read_file` | `errors="replace"` 防二进制崩溃，行号右对齐输出，头部标注文件路径 |
 | `search` | 优先用 `rg`（搜索延迟直接影响 agent 效率），无 rg 时回退 Python 纯文本搜索，上限 200 匹配 |
+| `glob` | 不把 pattern 当路径解析，只在已锚定 workspace 的候选文件上匹配，避免路径逃逸 |
+| `symbol_search` | 针对常见语言的 def/class/type/import/引用做轻量模式匹配，补齐“查定义/引用/类型”的闭环能力 |
 | `web_search` | 零依赖 DuckDuckGo HTML 搜索，支持域名白/黑名单过滤，失败返回错误文本而非抛异常 |
 | `run_shell` | `cwd` 锚定仓库根，环境变量只放行白名单（减少密钥泄露），`partial_success` 区分非零退出码 |
 | `write_file` | `parents=True` 自动创建中间目录，覆盖写入 |
