@@ -141,6 +141,55 @@ def test_context_manager_relevant_memory_uses_bm25_after_tag_match(tmp_path):
     assert relevant_section.index("cache cache cache") < relevant_section.index("cache summary")
 
 
+def test_context_manager_relevant_memory_uses_recent_history_for_followups(tmp_path):
+    agent = build_agent(tmp_path, [])
+    agent.memory.append_note(
+        "vector index timeout workaround",
+        created_at="2026-04-07T10:00:00+00:00",
+    )
+    agent.memory.append_note(
+        "unrelated cache cleanup",
+        created_at="2026-04-07T10:01:00+00:00",
+    )
+    agent.append_session_history(
+        {
+            "role": "user",
+            "content": "We were debugging vector index timeout",
+            "created_at": "2026-04-07T10:02:00+00:00",
+        }
+    )
+    agent.append_session_history(
+        {
+            "role": "assistant",
+            "content": "I found the failing retry path.",
+            "created_at": "2026-04-07T10:03:00+00:00",
+        }
+    )
+
+    _prompt, metadata = ContextManager(agent).build("what about that?")
+
+    assert metadata["relevant_memory"]["selected_notes"] == ["vector index timeout workaround"]
+    assert "recent_user: We were debugging vector index timeout" in metadata["retrieval_query"]["text"]
+    assert metadata["retrieval_query"]["history_entries"] == 2
+
+
+def test_context_manager_relevant_memory_uses_task_and_recent_files(tmp_path):
+    agent = build_agent(tmp_path, [])
+    agent.memory.set_task_summary("stabilize planner state machine")
+    agent.memory.remember_file("enigma/runtime.py")
+    agent.memory.append_note(
+        "planner state machine invariant lives in runtime",
+        created_at="2026-04-07T10:00:00+00:00",
+    )
+
+    _prompt, metadata = ContextManager(agent).build("continue")
+
+    assert metadata["relevant_memory"]["selected_notes"] == ["planner state machine invariant lives in runtime"]
+    assert "task_summary: stabilize planner state machine" in metadata["retrieval_query"]["text"]
+    assert "recent_files: enigma/runtime.py" in metadata["retrieval_query"]["text"]
+    assert metadata["retrieval_query"]["has_task_summary"] is True
+
+
 def test_episodic_notes_keep_latest_twenty_four_entries(tmp_path):
     agent = build_agent(tmp_path, [])
 
@@ -321,4 +370,3 @@ def test_context_manager_relevant_memory_reserves_slots_for_durable_notes(tmp_pa
     assert "episodic cache note 2" in relevant_section
     assert "Durable cache convention one." in relevant_section
     assert "Durable cache convention two." in relevant_section
-

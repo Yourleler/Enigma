@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from .memory import MemoryNote
@@ -54,6 +55,9 @@ DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "rolling_summ
 SECTION_ORDER = ("prefix", "startup_memory", "memory", "relevant_memory", "rolling_summary", "history", "current_request")
 CURRENT_REQUEST_SECTION = "current_request"
 RELEVANT_MEMORY_LIMIT = 4
+RETRIEVAL_HISTORY_WINDOW = 6
+RETRIEVAL_PROCESS_NOTE_LIMIT = 4
+RETRIEVAL_QUERY_CHAR_LIMIT = 2400
 
 
 def _tail_clip(text, limit):
@@ -65,6 +69,18 @@ def _tail_clip(text, limit):
     if limit <= 3:
         return text[:limit]
     return text[: limit - 3] + "..."
+
+
+def _dedupe_nonempty(items):
+    seen = set()
+    result = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 @dataclass
@@ -152,9 +168,10 @@ class ContextManager:
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
         if checkpoint_text:
             section_texts["prefix"] = checkpoint_text + "\n\n" + section_texts["prefix"]
+        retrieval_query, retrieval_details = self._build_retrieval_query(user_message)
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
-            selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
+            selected_notes = self.agent.memory.retrieval_candidates(retrieval_query, limit=RELEVANT_MEMORY_LIMIT)
 
         if not context_reduction_enabled:
             rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
@@ -167,6 +184,8 @@ class ContextManager:
                 selected_notes=selected_notes,
                 user_message=user_message,
                 section_texts=section_texts,
+                retrieval_query=retrieval_query,
+                retrieval_details=retrieval_details,
             )
             return prompt, metadata
 
@@ -247,6 +266,8 @@ class ContextManager:
             selected_notes=selected_notes,
             user_message=user_message,
             section_texts=section_texts,
+            retrieval_query=retrieval_query,
+            retrieval_details=retrieval_details,
         )
         return prompt, metadata
 
@@ -338,6 +359,145 @@ class ContextManager:
         if not text:
             return ""
         return "会话滚动摘要:\n" + text
+
+    def _build_retrieval_query(self, user_message):
+        """构造记忆召回 query。
+
+        召回不只看本轮字面输入；追问、代词和“刚才那个”都需要最近对话、
+        当前任务状态、最近文件和过程性错误来补全语境。这里保持确定性和零依赖，
+        LLM query rewrite 之后可以作为额外一路接在这个函数旁边。
+        """
+        user_message = str(user_message or "").strip()
+        raw_query = user_message
+        use_context = self._should_expand_retrieval_query(user_message)
+        parts = []
+        details = {
+            "history_entries": 0,
+            "recent_files": [],
+            "has_task_summary": False,
+            "process_notes": 0,
+            "strategy": "expanded" if use_context else "current_request",
+        }
+
+        if user_message:
+            parts.append(f"current_request: {user_message}")
+
+        if not use_context:
+            query = raw_query
+            details["query_chars"] = len(query)
+            details["query_tokens"] = estimate_tokens(query)
+            return query, details
+
+        memory = getattr(self.agent, "memory", None)
+        memory_snapshot = {}
+        if memory is not None and hasattr(memory, "to_dict"):
+            try:
+                memory_snapshot = memory.to_dict()
+            except Exception:
+                memory_snapshot = {}
+
+        working = memory_snapshot.get("working", {}) if isinstance(memory_snapshot, dict) else {}
+        task_summary = str(working.get("task_summary", "")).strip() if isinstance(working, dict) else ""
+        if task_summary and task_summary != user_message:
+            details["has_task_summary"] = True
+            parts.append(f"task_summary: {task_summary}")
+
+        recent_files = []
+        if isinstance(working, dict):
+            recent_files = [str(path).strip() for path in working.get("recent_files", []) if str(path).strip()]
+        if recent_files:
+            details["recent_files"] = list(recent_files)
+            parts.append("recent_files: " + " ".join(recent_files))
+
+        history_parts = self._retrieval_history_parts()
+        details["history_entries"] = len(history_parts)
+        parts.extend(history_parts)
+
+        process_parts = self._retrieval_process_note_parts(memory_snapshot)
+        details["process_notes"] = len(process_parts)
+        parts.extend(process_parts)
+
+        query = "\n".join(_dedupe_nonempty(parts)).strip() or user_message
+        query = _tail_clip(query, RETRIEVAL_QUERY_CHAR_LIMIT)
+        details["query_chars"] = len(query)
+        details["query_tokens"] = estimate_tokens(query)
+        return query, details
+
+    def _should_expand_retrieval_query(self, user_message):
+        text = str(user_message or "").strip()
+        if not text:
+            return False
+        english_markers = {
+            "that",
+            "this",
+            "those",
+            "these",
+            "it",
+            "continue",
+            "same",
+            "previous",
+            "earlier",
+        }
+        query_tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_]+", text)}
+        if query_tokens & english_markers:
+            return True
+        chinese_markers = ("刚才", "那个", "这个", "这些", "那些", "继续", "上次", "前面")
+        if any(marker in text for marker in chinese_markers):
+            return True
+        # 短追问通常没有足够检索词，需要靠会话/任务状态补全。
+        return len(text.split()) <= 3
+
+    def _retrieval_history_parts(self):
+        session = getattr(self.agent, "session", None) or {}
+        history = list(session.get("history", []))
+        if not history:
+            return []
+
+        parts = []
+        for item in history[-RETRIEVAL_HISTORY_WINDOW:]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip()
+            if role == "tool":
+                name = str(item.get("name", "")).strip() or "tool"
+                args = item.get("args", {})
+                path = ""
+                command = ""
+                if isinstance(args, dict):
+                    path = str(args.get("path", "")).strip()
+                    command = str(args.get("command", "")).strip()
+                content = _tail_clip(str(item.get("content", "")).strip(), 240)
+                pieces = [f"recent_tool:{name}", path, command, content]
+                parts.append(" ".join(piece for piece in pieces if piece))
+                continue
+            if role in {"user", "assistant", "system"}:
+                content = _tail_clip(str(item.get("content", "")).strip(), 300)
+                if content:
+                    parts.append(f"recent_{role}: {content}")
+        return parts
+
+    def _retrieval_process_note_parts(self, memory_snapshot):
+        if not isinstance(memory_snapshot, dict):
+            return []
+        notes = memory_snapshot.get("episodic_notes", [])
+        if not isinstance(notes, list):
+            return []
+        selected = []
+        for note in reversed(notes):
+            if not isinstance(note, dict):
+                continue
+            tags = {str(tag).strip().lower() for tag in note.get("tags", []) if str(tag).strip()}
+            kind = str(note.get("kind", "")).strip().lower()
+            is_process = kind == "process" or bool(tags & {"process", "error", "rejected", "partial_success", "test"})
+            if not is_process:
+                continue
+            text = _tail_clip(str(note.get("text", "")).strip(), 220)
+            if not text:
+                continue
+            selected.append(f"process_note: {text} {' '.join(sorted(tags))}")
+            if len(selected) >= RETRIEVAL_PROCESS_NOTE_LIMIT:
+                break
+        return list(reversed(selected))
 
     def _render_relevant_memory(self, selected_notes, budget):
         header = "召回记忆:"
@@ -555,7 +715,18 @@ class ContextManager:
             parts.append(text)
         return "\n\n".join(parts).strip()
 
-    def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts):
+    def _metadata(
+        self,
+        prompt,
+        rendered,
+        budgets,
+        reduction_log,
+        selected_notes,
+        user_message,
+        section_texts,
+        retrieval_query,
+        retrieval_details,
+    ):
         section_metadata = {}
         for section in SECTION_ORDER[:-1]:
             section_metadata[section] = {
@@ -585,6 +756,10 @@ class ContextManager:
             "sections": section_metadata,
             "budget_reductions": reduction_log,
             "reduction_order": list(self.reduction_order),
+            "retrieval_query": {
+                "text": retrieval_query,
+                **dict(retrieval_details or {}),
+            },
             "relevant_memory": {
                 "limit": RELEVANT_MEMORY_LIMIT,
                 "selected_count": len(selected_notes),
