@@ -13,6 +13,7 @@ import json
 import re
 from uuid import uuid4
 
+from .static_review import format_static_findings, scan_python_files
 from .task_state import TaskState
 from .workspace import clip, now
 
@@ -114,6 +115,7 @@ class OrchestrationRun:
     plan_steps: list[PlanStep] = field(default_factory=list)
     step_results: list[StepResult] = field(default_factory=list)
     review_findings: list[ReviewFinding] = field(default_factory=list)
+    static_findings: list[dict] = field(default_factory=list)
     retries: int = 0
     retry_limit: int = 2
     final_answer: str = ""
@@ -128,6 +130,7 @@ class OrchestrationRun:
             "plan_steps": [step.to_dict() for step in self.plan_steps],
             "step_results": [result.to_dict() for result in self.step_results],
             "review_findings": [finding.to_dict() for finding in self.review_findings],
+            "static_findings": list(self.static_findings),
             "retries": self.retries,
             "retry_limit": self.retry_limit,
             "final_answer": self.final_answer,
@@ -245,6 +248,8 @@ class Orchestrator:
         self._transition(STATE_REVIEWING, role="Reviewer")
         diff, source = self.agent.workspace.git_diff() if self.agent.workspace.is_git_repo else ("", "workspace files")
         files = self._changed_files()
+        static_findings = scan_python_files(files, self.agent.workspace.repo_root)
+        self.run.static_findings = [finding.to_dict() for finding in static_findings]
         prompt = build_review_prompt(
             task=self.run.task,
             plan=self.run.plan,
@@ -252,6 +257,7 @@ class Orchestrator:
             diff=diff,
             source=source,
             files=files,
+            static_findings=static_findings,
         )
         previous_read_only = self.agent.read_only
         self.agent.read_only = True
@@ -270,8 +276,16 @@ class Orchestrator:
             self.agent.prefix_state = self.agent.build_prefix()
             self.agent.prefix = self.agent.prefix_state.text
         findings = parse_review_findings(review)
+        findings.extend(static_findings_to_blocking_review_findings(static_findings))
         self.run.review_findings = findings
-        self._trace("orchestration_reviewed", {"review": clip(review, 700), "findings": [f.to_dict() for f in findings]})
+        self._trace(
+            "orchestration_reviewed",
+            {
+                "review": clip(review, 700),
+                "findings": [f.to_dict() for f in findings],
+                "static_findings": self.run.static_findings,
+            },
+        )
         if any(finding.is_blocking() for finding in findings):
             self._transition(STATE_REPAIR_PLANNING, role="Reviewer", reason="blocking review finding")
             return
@@ -410,8 +424,26 @@ def parse_review_findings(review_text):
     return findings[:10]
 
 
-def build_review_prompt(task, plan, step_results, diff, source, files):
+def static_findings_to_blocking_review_findings(static_findings):
+    findings = []
+    for finding in static_findings or []:
+        if str(finding.severity).lower() not in CRITICAL_SEVERITIES:
+            continue
+        findings.append(
+            ReviewFinding(
+                severity=finding.severity,
+                file=finding.file,
+                line=str(finding.line),
+                message=f"{finding.rule_id}: {finding.message}",
+                recommended_action="Triage this static finding before marking orchestration done.",
+            )
+        )
+    return findings
+
+
+def build_review_prompt(task, plan, step_results, diff, source, files, static_findings=None):
     file_list = "\n".join(f"- {path}" for path in files) if files else "(no changed files detected)"
+    static_text = format_static_findings(static_findings or [])
     return (
         "Reviewer role: review the completed execution against the approved plan. "
         "Do not modify files. Return findings grouped by severity. "
@@ -420,6 +452,9 @@ def build_review_prompt(task, plan, step_results, diff, source, files):
         f"Approved / active plan:\n{plan}\n\n"
         f"Step results:\n{json.dumps(step_results, ensure_ascii=False, indent=2)}\n\n"
         f"Changed files:\n{file_list}\n\n"
+        f"Static findings:\n{static_text}\n\n"
+        "Treat static findings as evidence to triage, not guaranteed bugs. "
+        "For each static finding, decide whether it looks real, a false positive, or needs a regression test.\n\n"
         f"Diff source: {source}\n"
         f"Diff:\n```\n{diff or '(empty)'}\n```"
     )

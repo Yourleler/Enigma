@@ -1,4 +1,5 @@
 import json
+from unittest.mock import patch
 
 from enigma import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
 from enigma.orchestration import parse_plan_steps, parse_review_findings
@@ -163,3 +164,25 @@ def test_reviewer_role_uses_read_only_tool_surface(tmp_path):
     assert "write_file" not in reviewer_prompt
     assert "patch_file" not in reviewer_prompt
     assert "run_shell" not in reviewer_prompt
+
+
+def test_orchestrate_static_critical_finding_blocks_done(tmp_path):
+    (tmp_path / "code.py").write_text("eval(user_input)\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            "<plan>\n## Steps\n1. Inspect code\n</plan>",
+            "<final>Executor completed the active step.</final>",
+            "<final>No findings.</final>",
+        ],
+    )
+
+    with patch.object(WorkspaceContext, "changed_files", return_value=["code.py"]):
+        result = agent.orchestrate("Inspect code", retry_limit=0)
+
+    assert result.startswith("Orchestration aborted:")
+    reviewer_prompt = next(prompt for prompt in agent.model_client.prompts if "Reviewer role:" in prompt)
+    assert "PY_DYNAMIC_EXEC" in reviewer_prompt
+    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
+    assert report["orchestration"]["static_findings"][0]["rule_id"] == "PY_DYNAMIC_EXEC"
+    assert report["orchestration"]["review_findings"][0]["severity"] == "critical"

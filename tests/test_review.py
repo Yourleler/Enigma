@@ -1,5 +1,6 @@
 """workspace.py 和 /review 命令的测试。"""
 
+import json
 from unittest.mock import patch
 
 from enigma import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
@@ -150,6 +151,7 @@ class TestBuildReviewPrompt:
         assert "- old" in prompt
         assert "+ new" in prompt
         assert "critical" in prompt.lower()
+        assert "Static findings:" in prompt
 
 
 # ── /review 命令 ────────────────────────────────────────────────
@@ -163,6 +165,36 @@ class TestReviewCommand:
         captured = capsys.readouterr()
         assert "Reviewing" in captured.out
         assert "code.py" in captured.out
+
+    def test_review_file_includes_static_findings_in_prompt(self, tmp_path, capsys):
+        (tmp_path / "code.py").write_text("def f(items=[]):\n    return items\n", encoding="utf-8")
+        agent = build_agent(tmp_path, ["<final>Finding triaged.</final>"])
+
+        handle_builtin_command(agent, "/review code.py")
+
+        captured = capsys.readouterr()
+        assert "Static findings: 1" in captured.out
+        prompt = agent.model_client.prompts[-1]
+        assert "Static findings:" in prompt
+        assert "PY_MUTABLE_DEFAULT" in prompt
+        assert "needs a regression test" in prompt
+
+    def test_review_static_findings_are_written_to_trace_and_report(self, tmp_path, capsys):
+        (tmp_path / "code.py").write_text("def f(items=[]):\n    return items\n", encoding="utf-8")
+        agent = build_agent(tmp_path, ["<final>Finding triaged.</final>"])
+
+        handle_builtin_command(agent, "/review code.py")
+
+        capsys.readouterr()
+        report = agent.run_store.load_report(agent.current_task_state)
+        assert report["review"]["static_findings"][0]["rule_id"] == "PY_MUTABLE_DEFAULT"
+        events = [
+            json.loads(line)
+            for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        event = next(item for item in events if item["event"] == "review_static_findings")
+        assert event["findings"][0]["rule_id"] == "PY_MUTABLE_DEFAULT"
 
     def test_review_nonexistent_file(self, tmp_path, capsys):
         (tmp_path / "README.md").write_text("x\n", encoding="utf-8")

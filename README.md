@@ -14,7 +14,7 @@ Enigma 是一个面向本地代码仓库的轻量级 coding agent。它运行在
 - **【本轮面试补强】工程化记忆系统**：工作记忆减少重复探索，情景记忆保留失败和执行节点，语义记忆记录跨会话稳定事实及其适用场景。
 - **上下文预算管理**：按模型上下文窗口动态设置 prompt budget，并在超限前压缩 history、工具结果和记忆片段。
 - **【本轮面试补强】Plan / Execute / Review / Repair 编排**：`/orchestrate` 通过固定角色和有限状态转移形成轻量多智能体闭环。
-- **Plan / Review / Skills**：内置 `/plan` 只读规划、`/review` 代码审查、`/skills` 技能加载等面向工程任务的命令。
+- **Plan / Review / Skills**：内置 `/plan` 只读规划、`/review` 代码审查、`/skills` 技能加载等面向工程任务的命令；`/review` 会先运行轻量 Python AST 静态规则，再交给模型做 triage。
 - **可追踪运行产物**：每次任务生成 `task_state.json`、`trace.jsonl`、`report.json`，便于复盘和调试。
 - **测试覆盖完整**：围绕 runtime、记忆、上下文管理、安全约束、技能系统、审查流程和 session DB 编写了单元测试。
 
@@ -26,6 +26,7 @@ Enigma 的定位不是“复刻一个聊天壳”，而是一个面向本地仓�
 - **工具边界不应只靠 prompt**：编码、路径和危险操作审批是确定性规则。Enigma 用 `HarnessPolicy` 和工具校验层保证 UTF-8 读写、workspace 锚定、risky tool 审批，而不是要求模型每次“记得遵守”。
 - **工具链需要覆盖常见 coding agent 闭环**：除了 `list_files`、`search`、`read_file`、`write_file` / `patch_file` 和 `run_shell`，Enigma 还补了 `glob` 和轻量 `symbol_search`，让模型能先定位文件和定义，再读取、修改、测试和修复。
 - **长期记忆需要触发场景**：语义记忆不只保存一句话，还可以保存 `problem` 和 `applies_when`，让 agent 知道这条约定未来在什么场景下用于解决什么问题。
+- **代码审查不能只靠主观判断**：`/review` 在 LLM 审查前先用确定性 AST 规则扫描 Python 文件，产出 `rule_id / severity / file / line / evidence` 结构化 finding，并写入 trace/report，方便复盘和后续 CI 阻断。
 - **计划、执行、审查需要闭环**：单个模型循环很难区分计划错、执行错还是审查发现新风险。`/orchestrate` 把 Planner、Executor、Reviewer、RepairPlanner 拆成固定角色，用状态转移和 retry limit 控制交互。
 
 这些设计都写入 `trace.jsonl` / `report.json`，并由 pytest 覆盖典型边界：路径逃逸、只读规划、记忆召回、review 阻断、repair 重试和 retry abort。
@@ -41,18 +42,21 @@ Enigma 的定位不是“复刻一个聊天壳”，而是一个面向本地仓�
 | 工具面和流程没有完整对齐 coding agent 常见闭环 | 新增 `glob`、轻量 `symbol_search`，并在正常/Plan prompt 中显式写入定位、读取、修改、测试、观察、修复流程 | `enigma/tools.py`、`enigma/runtime.py`、`tests/test_enigma.py` | “我没有只在文档里说 workflow，而是补了模型可调用的文件定位和符号定位工具，并把闭环写进系统 prompt。” |
 | 记忆系统说不清什么时候触发、解决什么问题 | durable memory 增加 `problem` 和 `applies_when`，召回时把适用场景展示给模型 | `enigma/memory.py`、`enigma/context_manager.py`、`tests/test_memory.py` | “长期记忆不只存文本，还存未来什么时候用它。这样才能解释记忆为什么会被召回。” |
 | multi-agent 不能只是线性流水线 | 新增 `/orchestrate`：Planner / Executor / Reviewer / RepairPlanner 固定角色，支持执行失败和 review finding 回到 RepairPlan，带 retry limit | `enigma/orchestration.py`、`enigma/cli.py`、`tests/test_orchestration.py` | “它不是开放 swarm，而是 bounded orchestration。角色边界、工具边界和状态转移都很清楚。” |
-| 项目缺少可验证证据 | 新增 orchestration、policy、memory 相关测试，并跑通真实 Ollama 调用链 | `231 passed`、`ruff check`、真实 `/orchestrate` 输出 | “我没有只写 README，补了回归测试和一次真实模型调用，能展示状态机确实完成闭环。” |
+| review 不能只是 LLM 主观读 diff | 新增轻量 AST 静态审查规则，先产出结构化 finding，再交给 LLM triage；finding 写入 trace/report，`/orchestrate` 中 critical 静态 finding 会阻断 DONE | `enigma/static_review.py`、`enigma/cli.py`、`enigma/orchestration.py`、`tests/test_static_review.py` | “我没有把它包装成完整静态分析器，而是做了最小可验证 pipeline：规则发现、模型复核、审计产物落盘。” |
+| 项目缺少可验证证据 | 新增 orchestration、policy、memory、static review 相关测试，并跑通真实 Ollama 调用链 | `242 passed`、`ruff check`、真实 `/orchestrate` 输出 | “我没有只写 README，补了回归测试和一次真实模型调用，能展示状态机确实完成闭环。” |
 
 ### 本轮新增或重点修改的文件
 
 - `enigma/policy.py`：本轮新增，承载 harness / tool policy 的确定性规则。
 - `enigma/orchestration.py`：本轮新增，实现 Plan / Execute / Review / Repair 状态机。
+- `enigma/static_review.py`：本轮新增，实现零依赖 Python AST 静态 finding 规则，覆盖可变默认参数、裸 `except`、`shell=True`、动态执行、缺少 encoding 和疑似硬编码密钥。
 - `enigma/cli.py`：本轮修改，新增 `/orchestrate <task>` 命令入口。
 - `enigma/memory.py`：本轮修改，durable memory 支持 `problem` 和 `applies_when`。
 - `enigma/context_manager.py`：本轮修改，召回记忆时展示适用场景。
 - `enigma/tools.py`：本轮修改，将 risky tool 与审批、plan mode 工具面进一步对齐。
 - `enigma/runtime.py`：本轮修改，在正常模式和 Plan 模式 prompt 中明确 coding loop，并暴露 `glob` / `symbol_search` 示例。
 - `tests/test_orchestration.py`：本轮新增，覆盖正常路径、repair、review 阻断、retry abort、只读 reviewer 工具面和 trace。
+- `tests/test_static_review.py`：本轮新增，覆盖可变默认参数、裸 except、`shell=True`、动态执行、缺少 encoding 和硬编码密钥等规则。
 - `tests/test_memory.py`、`tests/test_plan_mode.py`、`tests/test_safety_invariants.py`：本轮补强，覆盖 applies_when、plan mode 工具限制和策略边界。
 
 ### 本轮真实验证
@@ -61,7 +65,7 @@ Enigma 的定位不是“复刻一个聊天壳”，而是一个面向本地仓�
 
 ```bash
 uv run pytest -q
-# 231 passed
+# 242 passed
 
 uv run ruff check .
 # All checks passed!
@@ -223,7 +227,7 @@ uv run enigma --provider anthropic
 - `/help`：查看内置命令
 - `/plan <task>`：进入只读探索与计划审批流程
 - `/orchestrate <task>`：运行 Plan / Execute / Review / Repair 轻量编排
-- `/review [target]`：审查当前变更、指定分支、PR 链接或文件
+- `/review [target]`：审查当前变更、指定分支、PR 链接或文件；Python 文件会先经过轻量 AST 静态规则扫描，finding 会进入模型 review、`trace.jsonl` 和 `report.json`
 - `/skills`：列出可用技能
 - `/compact [focus]`：压缩工作记忆、情景记忆、语义记忆和 history
 - `/memory`：查看当前记忆摘要
@@ -247,6 +251,8 @@ uv run enigma --approval never
 - `.enigma/runs/<run_id>/task_state.json`
 - `.enigma/runs/<run_id>/trace.jsonl`
 - `.enigma/runs/<run_id>/report.json`
+
+`/review` 的结构化静态 finding 会写入同一轮 run 的 `review.static_findings`，并在 trace 中记录 `review_static_findings` 事件。`/orchestrate` 的 Reviewer 也会把 static findings 写入 orchestration report；critical 静态 finding 会阻断完成并进入 repair 流程。
 
 这些内容包含本地运行轨迹，已在 `.gitignore` 中排除，不会随仓库提交。
 

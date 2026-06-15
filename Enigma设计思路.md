@@ -351,7 +351,58 @@ Plan ready
 - 分支对比。
 - PR 链接。
 
-它会基于 workspace diff、文件内容和用户目标生成 severity 分组的审查意见。Reviewer 的定位是“发现问题”，不是直接修改。
+它不是只把 diff 丢给模型。当前实现会先对 Python 文件运行一组零依赖 AST 静态规则，产出结构化 finding：
+
+- `rule_id`
+- `severity`
+- `category`
+- `file`
+- `line`
+- `message`
+- `evidence`
+
+首批规则刻意保持小而高信号：可变默认参数、裸 `except`、`subprocess.*(..., shell=True)`、`eval` / `exec`、`open()` 缺少 `encoding`、疑似硬编码密钥，以及语法错误 / 读取失败的 warning finding。
+
+这些规则的判断点和原因是：
+
+| 规则 | 典型代码 | 为什么需要提示 |
+| --- | --- | --- |
+| 可变默认参数 | `def f(items=[])` | 默认值只创建一次，多次调用会共享同一个列表 / 字典，容易让上一次调用的数据污染下一次调用。 |
+| 裸 `except` | `except:` | 会捕获过宽，可能吞掉中断、系统退出或真正严重的错误，让失败被隐藏。 |
+| `shell=True` | `subprocess.run(cmd, shell=True)` | 如果 `cmd` 拼了用户输入，可能变成命令注入；更安全的写法通常是传参数列表。 |
+| `eval` / `exec` | `eval(user_input)` | 会把字符串当代码执行，遇到不可信输入时等于开放任意代码执行。 |
+| `open()` 缺少 `encoding` | `open("data.txt")` | 不同系统默认编码可能不同，本地正常的文件读写到别的机器可能乱码或报错。 |
+| 疑似硬编码密钥 | `API_KEY = "sk-..."` | 密钥写进源码容易被提交到 git、进入日志或被他人复用，应该放环境变量或本地配置。 |
+| 语法错误 / 读取失败 | AST parse/read 失败 | 说明结构化扫描没有完整跑完，需要在 review 结果中显式暴露这个事实。 |
+
+这些不是为了覆盖所有 bug，而是先抓最容易出事故、最容易解释、最适合本地 review demo 的 Python 常见坑。
+
+随后 `/review` 把 workspace diff、文件内容和 static findings 一起交给模型，要求模型对 finding 做 triage：判断是真实问题、误报，还是需要回归测试验证。Reviewer 的定位仍然是“发现问题”，不是直接修改。
+
+这一步的关键不是把 Enigma 包装成完整静态分析器，而是把 review 从纯 LLM 主观判断推进到一个可追踪 pipeline：
+
+```text
+Python AST rules
+  -> structured static findings
+  -> LLM triage
+  -> trace.jsonl / report.json
+```
+
+独立 `/review` 会在 `trace.jsonl` 中写入 `review_static_findings` 事件，并把结构化结果写入 `report.json` 的 `review.static_findings`。`/orchestrate` 的 Reviewer 也会读取 static findings；如果出现 critical 静态 finding，会阻断 `DONE` 并进入 RepairPlanner。
+
+面试时可以这样讲：
+
+> 我没有把 `/review` 做成一个纯 prompt 功能。它前面先接了一层确定性的 Python AST 静态扫描，把一些高信号缺陷模式变成结构化 finding，比如 `rule_id`、严重程度、文件、行号和证据。然后模型不是凭空审查，而是对这些 finding 和 diff 一起做 triage：判断是真问题、误报，还是需要回归测试验证。最后这些 finding 会进入 `trace.jsonl` 和 `report.json`，所以审查过程可复盘、可统计，也能在 `/orchestrate` 里作为阻断条件。
+
+如果面试官问“这和 Codex / Claude Code 的 review 有什么区别”，回答重点是：
+
+- Codex / Claude Code 的优势是大模型能力、上下文理解、真实工程交互和成熟 UX，Enigma 不试图复刻这些。
+- Enigma 这里展示的是 harness 层的工程思路：把一部分 review 从主观自然语言判断，前移到可复现的静态规则；把结果结构化落盘；再让 LLM 做解释、降噪和修复建议。
+- 这不是完整静态分析器，还没有 CFG / dataflow / taint analysis，也没有跨语言规则库。当前目标是最小闭环：规则发现 -> 模型复核 -> 审计产物 -> critical 阻断。
+
+如果面试官继续问“下一步怎么增强”，不要先说单测自愈。更稳的回答是：
+
+> 下一步我会给 high / critical finding 增加回归测试生成：先让 agent 尝试写一个能复现问题的 failing test，修复后再跑测试验证。这样 review finding 就不只是建议，而是尽量变成可验证缺陷。
 
 ### 6.3 `/orchestrate` 轻量多智能体编排
 
@@ -597,7 +648,65 @@ Enigma 保持零运行时依赖，因此没有引入 embedding 和向量库，�
 - 新旧程度。
 - 插入顺序。
 
-### 7.8 记忆进入 prompt 的方式
+### 7.8 召回 query 怎么生成
+
+**本轮补强**：相关记忆召回不再简单等于“拿本轮用户输入整句去搜”。
+
+旧版问题：
+
+```text
+user_message -> tokenize -> BM25
+```
+
+这种写法能跑，但在面试时很容易被追问：如果用户说“那刚才那个怎么办”“继续”“this one 呢”，本轮输入本身没有足够关键词，直接搜会漏召回；如果盲目把全部 history 都拼进去，又会把无关历史噪音带进检索，导致误召回。
+
+新版做法是在 `ContextManager.build()` 里先构造 `retrieval_query`，再把它传给 `memory.retrieval_candidates()`：
+
+```text
+当前请求
+  |
+  v
+判断是否是上下文依赖型请求
+  - 短追问
+  - this / that / continue / previous
+  - 刚才 / 这个 / 那个 / 继续 / 上次
+  |
+  +-- 否 -> 只用当前请求召回
+  |
+  +-- 是 -> 构造扩展 retrieval_query
+          - current_request
+          - 最近 6 条 history
+          - working.task_summary
+          - recent_files
+          - 最近 process / error notes
+```
+
+这里有一个刻意的取舍：**不是所有请求都无脑拼 history**。如果用户的当前请求已经很明确，例如“Finish the README update after prompt compression creates a checkpoint”，就只用当前请求做召回，避免历史里大量重复词把无关记忆拉进来。如果用户明显在追问上下文，例如“what about that?” 或“继续”，才启用扩展 query。
+
+工程上可以解释成“两级策略”：
+
+| 场景 | 策略 | 原因 |
+| --- | --- | --- |
+| 当前请求语义明确 | `strategy=current_request` | 减少历史噪音，保持 BM25 精准 |
+| 短追问 / 代词 / 继续类请求 | `strategy=expanded` | 用最近对话和任务状态补全省略信息 |
+
+扩展 query 仍然是确定性构造，不额外调用模型，所以不会增加延迟和成本。后续如果要加 LLM query rewriter，可以把它作为第三路补充，而不是替代这个确定性兜底。
+
+面试时可以这样讲：
+
+> 记忆召回的 query 不是大模型临场“想一个关键词”，也不是永远拿用户原话去搜。Enigma 现在先判断本轮请求是不是上下文依赖型。如果是明确任务，就用当前请求，避免历史噪音；如果是“刚才那个”“continue”这类追问，就把最近 history、task summary、recent files 和错误过程笔记拼成扩展 query。这样既能处理追问，又不会把所有历史都变成检索噪音。
+
+如果面试官问“这是不是一个专门的 memory agent”，回答：
+
+> 当前实现不是单开一个 LLM 子 agent，而是一个轻量 retrieval planner。它在 ContextManager 里确定性地产生 retrieval_query。这样更便宜、更可测，也避免 query rewrite 本身被模型写错。未来可以在这个 planner 旁边加一个可选小模型 query rewrite，形成 raw query + deterministic context query + LLM rewrite 的多路召回。
+
+可验证证据：
+
+- `tests/test_context_manager.py` 覆盖 `what about that?` 通过最近 history 召回。
+- `tests/test_context_manager.py` 覆盖 `continue` 通过 task summary / recent files 召回。
+- `prompt_metadata["retrieval_query"]` 会记录本轮实际 query、策略、query 长度、history 条数、recent files 和 process note 数量。
+
+### 7.9 记忆进入 prompt 的方式
 
 prompt 中记忆分成两类：
 
@@ -679,7 +788,36 @@ history 压缩细节：
 - `run_shell` 压缩为命令和 stdout 前几行。
 - 其他旧记录压缩成短摘要。
 
-### 8.4 Prompt Cache
+### 8.4 召回与预算的关系
+
+`relevant_memory` 是按需召回出来的片段，不是固定塞满 prompt 的历史。它有独立预算，而且在超预算时最先让位：
+
+```text
+relevant_memory -> history -> memory -> rolling_summary -> startup_memory -> prefix
+```
+
+这样设计的原因是：
+
+- 当前请求永远最重要，不能被记忆挤掉。
+- 召回记忆是“候选提示”，不是硬事实全集。
+- 如果 prompt 太长，宁愿少带几条相关记忆，也不能破坏工具协议、路径安全和当前任务。
+
+本轮新增的 `retrieval_query` 也不会直接进入 prompt 正文，它只用于决定哪些记忆进入 `relevant_memory`。真正放进 prompt 的仍然是召回后的短 note。调试和面试展示时，可以看 `prompt_metadata["retrieval_query"]`：
+
+```json
+{
+  "strategy": "expanded",
+  "history_entries": 2,
+  "recent_files": ["enigma/runtime.py"],
+  "has_task_summary": true,
+  "process_notes": 0,
+  "query_chars": 180
+}
+```
+
+这可以回答“你怎么证明不是黑箱召回”：每一轮实际用什么 query、有没有走扩展、带了几条 history，都会落到 metadata 里。
+
+### 8.5 Prompt Cache
 
 `prefix` 是最稳定的一段，包括：
 
@@ -889,6 +1027,8 @@ topics 文件用于按需召回更细的主题内容：
 
 测试使用 `FakeModelClient`，不依赖真实模型调用。
 
+当前 `tests/` 下有 13 个 `test*.py` 文件，按 `def test_` 统计约 231 个测试用例。它们不是只测函数输入输出，而是围绕 coding agent harness 的关键不变式组织：模型输出可控、工具边界可控、运行产物可复盘。
+
 覆盖方向：
 
 - runtime 主循环。
@@ -903,9 +1043,34 @@ topics 文件用于按需召回更细的主题内容：
 - SessionDB。
 - orchestration。
 
+文件级覆盖可以这样理解：
+
+| 测试文件 | 重点内容 | 面试时回答什么问题 |
+| --- | --- | --- |
+| `tests/test_enigma.py` | 最大测试集，覆盖 `Enigma.ask()` 主循环、`<tool>/<final>` 解析、工具调用、session 保存恢复、delegate、web_search、模型 client、checkpoint、compact、durable memory、trace/report 脱敏 | “这个 agent 不是只写了 prompt，主循环和状态恢复都有回归测试” |
+| `tests/test_safety_invariants.py` | 路径逃逸、symlink 穿越、risky tool 审批、只读 delegate、shell 环境变量白名单、密钥脱敏 | “文件和 shell 权限是 harness 硬边界，不靠模型自觉” |
+| `tests/test_context_manager.py` | prompt section 顺序、预算压缩、相关记忆 BM25 召回、历史裁剪、重复文件读取摘要 | “长上下文不是简单截断，而是分区预算和降级策略” |
+| `tests/test_memory.py` | 工作记忆、情景记忆、文件摘要 freshness、shell 失败摘要、durable memory topic 读写、去重和上限 | “记忆分层，而且有 freshness 和 topic contract” |
+| `tests/test_plan_mode.py` | `<plan>` 解析、Plan 模式工具过滤、只读 prefix、审批后执行、delegate 不继承 plan mode、plan 文件持久化 | “规划阶段和执行阶段权限不同，计划不会悄悄写文件” |
+| `tests/test_review.py` | git repo 检测、git diff、changed files、review prompt、review command | “review 不是随口问模型，会带 diff 和结构化上下文” |
+| `tests/test_orchestration.py` | plan step 解析、blocking finding、Plan -> Execute -> Review -> Repair 状态机、retry limit、Reviewer 只读工具面 | “multi-agent 是 bounded 状态机，不是不可控群聊” |
+| `tests/test_skills.py` | skill frontmatter、三源发现、目录式 skill、metadata block、skill prompt 构建 | “技能系统是按需加载，不把所有模板塞进 prompt” |
+| `tests/test_session_db.py` | SQLite schema、消息落库、FTS 搜索、rolling summary、startup memory 注入、session 隔离 | “跨会话检索和摘要是可落盘、可搜索的” |
+| `tests/test_evaluator.py` | benchmark schema 校验、fixture copy、run directory、结果 metadata、failure category 汇总 | “固定评测不是人工点一点，而是可重复 harness” |
+| `tests/test_metrics.py` | context / memory / recovery ablation 产物、核心报告指标 | “项目能做消融实验，不只报最终成功/失败” |
+| `tests/test_run_store.py` | run 目录、`task_state.json`、`trace.jsonl`、`report.json` | “每次运行都有审计工件” |
+| `tests/test_task_state.py` | TaskState 初始状态、成功状态、step/retry limit、snapshot | “任务生命周期是显式状态机” |
+
+如果面试官问“为什么用 FakeModelClient”，回答重点是：这里测的是 harness 稳定性，不是评测某个大模型能力。真实模型有随机性和网络变量，适合做端到端 sanity check；但路径安全、审批、恢复、trace 这些工程不变式必须用确定性模型输出来压住。
+
 ### 13.2 BenchmarkEvaluator
 
 固定 benchmark 从 `benchmarks/coding_tasks.json` 读取任务，把 fixture repo 复制到临时 workspace，然后用 FakeModelClient 确定性执行。
+
+当前固定 benchmark 有 12 个任务，使用两个极小 fixture：
+
+- `tests/fixtures/bench_repo_readme/README.md`：一个 README 占位文档，包含 placeholder opening sentence 和两条 placeholder notes。
+- `tests/fixtures/bench_repo_patch/sample.txt`：四行文本 `alpha / beta / gamma / placeholder`，用于测试精确文本替换和恢复路径。
 
 测试集构建原则：
 
@@ -939,6 +1104,23 @@ topics 文件用于按需召回更细的主题内容：
 | `tool-boundary` | 工具参数错误、路径逃逸、重复调用后能否恢复 | `invalid_patch_recovery`、`path_escape_recovery`、`repeated_read_recovery` |
 | `recovery` | prompt 压缩 checkpoint、freshness mismatch、workspace mismatch | `context_reduction_checkpoint`、`freshness_reanchor_resume`、`workspace_mismatch_resume` |
 | `durable-contract` | 稳定记忆提升与拒绝规则是否正确落盘和记录 | `durable_promotion_accept`、`durable_promotion_reject` |
+
+逐项展开如下：
+
+| 任务 id | 做什么 | 主要验证点 |
+| --- | --- | --- |
+| `readme_intro_locked` | 把 README 开头占位句替换为固定 benchmark 文案 | 基本 read + patch + verifier 闭环 |
+| `readme_schema_note` | 把 README 第一条 bullet 改成 schema / baseline 固定说明 | 文档局部修改，验证最小补丁 |
+| `sample_beta_locked` | 把 `sample.txt` 中的 `beta` 改成 `beta-locked` | 精确文本替换，确保旧 `beta` 不残留 |
+| `sample_gamma_locked` | 把 `gamma` 改成 `gamma-locked` | 同类文本编辑回归 |
+| `invalid_patch_recovery` | 先制造无效 patch 参数，再恢复完成 README patch | 工具参数错误后的恢复能力 |
+| `path_escape_recovery` | 模拟路径逃逸被拒绝后，仍完成 `sample.txt` patch | path safety 不是终止任务，而是可恢复错误 |
+| `repeated_read_recovery` | 模拟重复 identical read 被拒绝后，仍完成 patch | 重复调用防护能促使模型换策略 |
+| `context_reduction_checkpoint` | 构造低预算和大量历史，让 prompt compression 触发 checkpoint | context reduction 和 checkpoint 事件落 trace/report |
+| `freshness_reanchor_resume` | 构造 stale 文件摘要，恢复时重新锚定真实文件 | resume 状态应为 `partial-stale`，不能信旧摘要 |
+| `workspace_mismatch_resume` | 构造 runtime/workspace identity 漂移 | resume 状态应为 `workspace-mismatch`，并记录 mismatch 事件 |
+| `durable_promotion_accept` | 把稳定 benchmark facts 提升为长期记忆 | durable promotions 写入 topics 文件和 report |
+| `durable_promotion_reject` | 只接受稳定事实，拒绝 transient 或 secret-shaped 内容 | durable rejections 记录原因，防止污染长期记忆 |
 
 一次 benchmark 的执行流程：
 
@@ -1011,7 +1193,7 @@ topics 文件用于按需召回更细的主题内容：
 
 ```bash
 uv run pytest -q
-# 231 passed
+# 242 passed
 
 uv run ruff check .
 # All checks passed!
@@ -1100,6 +1282,7 @@ Enigma 没有引入 LangGraph、AutoGen、Chroma、FAISS、embedding 模型等�
 | **本轮补强：Harness Policy** | 把 UTF-8、路径安全、审批、plan/reviewer 工具面放到硬约束层 | 第 5 章 |
 | **本轮补强：Orchestration** | `/orchestrate` 用 Planner / Executor / Reviewer / RepairPlanner 形成有回退的闭环 | 第 6 章 |
 | **本轮补强：Memory applies_when** | 长期记忆不只存文本，还存未来什么时候召回 | 第 7 章 |
+| **本轮补强：Retrieval query** | 追问类请求会结合 history / task / files 构造召回 query，明确任务避免历史噪音 | 第 7 章、第 8 章 |
 | 工具安全护栏 | 白名单、schema、路径穿越、审批、重复调用、diff、trace | 第 5 章 |
 | 上下文预算 | 六段式 prompt、模型窗口自动匹配、分类压缩 | 第 8 章 |
 | 分层记忆 | 工作 / 情景 / 语义三层生命周期 | 第 7 章 |
@@ -1143,11 +1326,44 @@ Enigma 没有引入 LangGraph、AutoGen、Chroma、FAISS、embedding 模型等�
 
 不要只说“三层记忆”，要说每一层的触发条件和使用场景。
 
-### 17.4 “和 Claude Code / Hermes 比，你这个记忆系统有什么自己的点？”
+### 17.4 “记忆召回的关键词是谁生成的？会不会写错？”
 
 短回答：
 
-> 我没有把目标定成复刻成熟产品。Claude Code 的强项是 Markdown-first 的项目记忆和 auto memory，Hermes 的强项是长期个人 agent 的 persistent memory、用户偏好和会话检索。Enigma 取的是中间路线：长期事实仍然落在 Markdown，方便审计和人工修改；运行时再分 working / episodic / semantic 三层；召回不用黑箱向量库，而是 BM25 / FTS5；最关键的是每条长期记忆带 `problem` 和 `applies_when`，所以它不是“记住一句话”，而是知道这条记忆未来解决什么问题。
+> Enigma 不依赖模型手写一个“召回关键词”。召回 query 由 runtime 在 `ContextManager` 里确定性构造：明确任务用当前请求；短追问、代词或“继续”这类上下文依赖请求，会额外拼最近 history、task summary、recent files 和 process notes。模型可以影响记忆正文怎么写，但召回 query 本身不是模型临时写的，所以不会因为模型忘写关键词就完全失效。
+
+展开回答：
+
+```text
+用户输入
+  |
+  +-- 明确任务 -> current_request query
+  |
+  +-- 追问/省略 -> expanded query
+        - current_request
+        - recent history
+        - working.task_summary
+        - recent_files
+        - process/error notes
+```
+
+如果面试官继续追问“那为什么不总是把所有 history 拼进去”，回答：
+
+> 因为检索 query 不是越长越好。history 里会有 benchmark、日志、重复工具输出这些噪音。无脑拼进去会让 BM25 命中无关记忆，甚至把 prompt 撑大。所以 Enigma 只在当前请求明显依赖上下文时扩展 query；普通明确任务保持 current_request 策略。
+
+如果面试官问“这是不是应该单开一个子 agent”，回答：
+
+> 成熟产品可能会有 memory agent 或 query rewriter，但我这里先做成 deterministic retrieval planner。原因是它便宜、可测、可解释，而且不会把召回成败押在另一个 LLM 输出上。未来可以加一个可选 LLM query rewrite，但它应该是多路召回的一路，而不是唯一入口。
+
+一句话收束：
+
+> 召回 query 是 harness 生成的，不是模型自由发挥；模型负责理解和使用召回结果，harness 负责让召回有可解释兜底。
+
+### 17.5 “和 Claude Code / Hermes 比，你这个记忆系统有什么自己的点？”
+
+短回答：
+
+> 我没有把目标定成复刻成熟产品。Claude Code 的强项是 Markdown-first 的项目记忆和 auto memory，Hermes 的强项是长期个人 agent 的 persistent memory、用户偏好和会话检索。Enigma 取的是中间路线：长期事实仍然落在 Markdown，方便审计和人工修改；运行时再分 working / episodic / semantic 三层；召回不用黑箱向量库，而是 BM25 / FTS5；最关键的是每条长期记忆带 `problem` 和 `applies_when`，同时 runtime 会根据追问类型构造 retrieval query，所以它不是“记住一句话”，而是知道这条记忆未来解决什么问题、什么时候更应该被召回。
 
 展开对比：
 
@@ -1156,7 +1372,7 @@ Enigma 没有引入 LangGraph、AutoGen、Chroma、FAISS、embedding 模型等�
 | 稳定记忆载体 | `CLAUDE.md`、auto memory 的 `MEMORY.md` 和 topic files，Markdown 可读可改 | `MEMORY.md` / `USER.md` 加会话检索，偏长期个人 agent | 学 Claude Code 的 Markdown-first，把稳定事实存在 `.enigma/memory/`，便于审计和删除 |
 | 自动沉淀 | Auto memory 会自动写入/召回项目经验 | 会学习环境、偏好、过往任务，甚至沉淀技能 | 有自动反思，但触发保守：process note、compact 前、用户明确“记住”时才提升 |
 | 用户画像 | 更偏项目指令和工作流，不把所有东西都画像化 | `USER.md` 明确承载用户偏好、沟通风格、长期习惯 | 不做标准化 KV profile，只保留 `user-preferences` topic，避免把临时要求误写成永久人格标签 |
-| 检索方式 | 启动加载索引，topic 按需读取 | SQLite / FTS5、episodic recall、插件或向量检索更完整 | BM25 + FTS5，零运行时依赖，对文件名、API、工具名、错误信息这类 coding 场景够直接 |
+| 检索方式 | 启动加载索引，topic 按需读取 | SQLite / FTS5、episodic recall、插件或向量检索更完整 | BM25 + FTS5，零运行时依赖；明确任务用当前请求，追问类请求扩展 history / task / files |
 | 记忆可信度 | Markdown 易审计，但自动记忆需要人工清理 | 召回和画像更强，但系统复杂度更高 | `problem` / `applies_when` 让每条 durable note 自带触发条件，可解释为什么进入 prompt |
 
 为什么不做标准化 KV 用户画像：
@@ -1165,9 +1381,9 @@ Enigma 没有引入 LangGraph、AutoGen、Chroma、FAISS、embedding 模型等�
 
 可以收束成一句：
 
-> Claude Code 给我的启发是 repo-native、Markdown-first、可审计；Hermes 给我的启发是长期 agent 需要把稳定事实、会话经验和检索分层。Enigma 的原创点是把这两者收缩成一个小而可测的 coding harness：Markdown 是权威源，BM25 / FTS5 是可解释召回，`applies_when` 是记忆触发条件。
+> Claude Code 给我的启发是 repo-native、Markdown-first、可审计；Hermes 给我的启发是长期 agent 需要把稳定事实、会话经验和检索分层。Enigma 的原创点是把这两者收缩成一个小而可测的 coding harness：Markdown 是权威源，BM25 / FTS5 是可解释召回，`applies_when` 是记忆触发条件，`retrieval_query` 是运行时可观测的召回决策。
 
-### 17.5 “这算 multi-agent 吗？是不是太轻？”
+### 17.6 “这算 multi-agent 吗？是不是太轻？”
 
 回答：
 
@@ -1181,13 +1397,13 @@ Enigma 没有引入 LangGraph、AutoGen、Chroma、FAISS、embedding 模型等�
 - 有 retry limit。
 - 有 trace/report。
 
-### 17.6 “为什么不用 LangGraph / AutoGen？”
+### 17.7 “为什么不用 LangGraph / AutoGen？”
 
 回答：
 
 > 这个项目的目标是展示本地 coding agent harness 的关键工程边界，不是搭一个复杂 agent graph 平台。引入 LangGraph 会让面试重点变成框架使用，而不是我自己对工具边界、状态机、记忆和 trace 的理解。所以我刻意做了一个小而可测的状态机。
 
-### 17.7 “为什么适配 Apple LLM/Agent Intern？”
+### 17.8 “为什么适配 Apple LLM/Agent Intern？”
 
 回答：
 
@@ -1201,10 +1417,11 @@ Enigma 没有引入 LangGraph、AutoGen、Chroma、FAISS、embedding 模型等�
 | `enigma/orchestration.py` | 新增 Plan / Execute / Review / Repair 状态机 | multi-agent 太轻 |
 | `enigma/cli.py` | 新增 `/orchestrate <task>` | 可实际调用 |
 | `enigma/memory.py` | durable memory 支持 `problem` / `applies_when` | 记忆触发条件不清 |
-| `enigma/context_manager.py` | 召回记忆时展示适用场景 | 记忆如何进入 prompt |
+| `enigma/context_manager.py` | 召回记忆时展示适用场景；新增 `retrieval_query` 构造，追问类请求会结合 history / task / files | 记忆如何进入 prompt、召回 query 谁生成 |
 | `enigma/tools.py` | delegate 视为 risky，plan mode 工具面更严格 | 工具边界 |
 | `tests/test_orchestration.py` | 新增 orchestration 状态机测试 | 闭环可验证 |
 | `tests/test_memory.py` | 补强 memory applies_when 测试 | 记忆可验证 |
+| `tests/test_context_manager.py` | 补强 follow-up retrieval、task summary / recent files 召回测试 | 召回 query 可验证 |
 | `tests/test_plan_mode.py` | 补强只读工具面测试 | plan mode 安全 |
 | `tests/test_safety_invariants.py` | 补强 policy / safety 测试 | harness 硬约束 |
 
@@ -1233,6 +1450,14 @@ A：不会。每个 topic 有上限，写入时过滤密钥、traceback、过长
 **Q：为什么 BM25 不用 embedding？**
 
 A：项目目标是零依赖，本地 coding agent 的召回很多是文件名、API、类名、工具名，BM25 对关键字足够有效。embedding 可以作为后续双路召回扩展。
+
+**Q：BM25 的 query 是用户整句话吗？**
+
+A：不是简单整句硬搜。明确任务使用当前请求；短追问、代词和“继续/刚才/that/this”这类请求会构造扩展 query，把最近 history、task summary、recent files 和 process notes 加进去。这样既能处理上下文追问，又避免所有任务都被历史噪音污染。
+
+**Q：如果模型没写关键词，记忆是不是就召不回来？**
+
+A：召回 query 不是模型写的，是 `ContextManager` 确定性生成的。模型可能影响记忆正文质量，但不会因为它忘了写一个关键词就没有 query。后续可以加 LLM query rewrite，但只作为补充一路。
 
 **Q：`/compact` 有什么坑？**
 
@@ -1605,18 +1830,36 @@ SessionDB 是增强路径，不是主流程硬依赖。
 
 ## A14. 测试覆盖索引
 
-关键测试方向：
+关键测试方向可以按两层记：
+
+- `tests/` 是单元和集成回归，约 231 个 pytest 用例，主要保证 harness 不变式。
+- `benchmarks/coding_tasks.json` 是固定 coding task 测试集，当前 12 个任务，主要保证端到端运行工件、恢复路径和 durable memory contract。
 
 | 测试 | 覆盖点 |
 | --- | --- |
-| `tests/test_enigma.py` | 主循环、parse、工具调用、trace、report |
-| `tests/test_safety_invariants.py` | 路径穿越、审批拒绝、secret redaction |
-| `tests/test_plan_mode.py` | plan mode、只读工具面、审批流程 |
-| `tests/test_review.py` | review 命令、diff、severity |
-| `tests/test_memory.py` | 分层记忆、durable memory、applies_when |
-| `tests/test_session_db.py` | SQLite / FTS5 / rolling summary |
-| `tests/test_orchestration.py` | Plan / Execute / Review / Repair 状态机 |
-| `tests/test_skills.py` | skill 发现、模板加载 |
+| `tests/test_enigma.py` | 主循环、parse、工具调用、模型 client、checkpoint、compact、trace、report、durable memory |
+| `tests/test_safety_invariants.py` | 路径穿越、symlink 逃逸、审批拒绝、read_only、delegate、安全环境变量、secret redaction |
+| `tests/test_context_manager.py` | prompt 分段预算、历史压缩、相关记忆召回、重复读取摘要 |
+| `tests/test_memory.py` | 分层记忆、file freshness、durable memory、applies_when、topic limit |
+| `tests/test_plan_mode.py` | plan mode、只读工具面、审批流程、plan 文件持久化 |
+| `tests/test_review.py` | review 命令、git diff、changed files、static finding / severity |
+| `tests/test_orchestration.py` | Plan / Execute / Review / Repair 状态机、blocking finding、retry limit、Reviewer 只读 |
+| `tests/test_skills.py` | skill 发现、frontmatter、目录式 skill、模板加载 |
+| `tests/test_session_db.py` | SQLite / FTS5 / rolling summary / startup memory / session 隔离 |
+| `tests/test_evaluator.py` | benchmark schema、fixture copy、run metadata、failure category |
+| `tests/test_metrics.py` | context / memory / recovery ablation 和 benchmark core report |
+| `tests/test_run_store.py` | `task_state.json`、`trace.jsonl`、`report.json` |
+| `tests/test_task_state.py` | TaskState 生命周期、stop reason、snapshot |
+
+固定 benchmark 12 个任务可以按 5 类回答：
+
+| 类别 | 任务 id | 面试回答重点 |
+| --- | --- | --- |
+| documentation | `readme_intro_locked`、`readme_schema_note` | 基本文档编辑闭环 |
+| text-edit | `sample_beta_locked`、`sample_gamma_locked` | 精确补丁和 verifier 验证 |
+| tool-boundary | `invalid_patch_recovery`、`path_escape_recovery`、`repeated_read_recovery` | 工具错误、路径拒绝、重复调用拒绝后仍能恢复 |
+| recovery | `context_reduction_checkpoint`、`freshness_reanchor_resume`、`workspace_mismatch_resume` | checkpoint、freshness、runtime identity 恢复分类 |
+| durable-contract | `durable_promotion_accept`、`durable_promotion_reject` | 长期记忆接受/拒绝规则可验证 |
 
 本轮新增或补强的重点是：
 

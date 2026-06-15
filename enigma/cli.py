@@ -17,6 +17,7 @@ from . import repl
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient, get_context_window
 from .runtime import Enigma, PlanResult, SessionStore
 from .skills import build_skill_prompt, discover_skills, list_skills
+from .static_review import format_static_findings, scan_python_files
 from .workspace import WorkspaceContext, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
@@ -469,8 +470,9 @@ def main(argv=None):
         # 暂存消息在下一轮 input() 返回空时自动发送（line 377-379）
 
 
-def _build_review_prompt(diff, source, files):
+def _build_review_prompt(diff, source, files, static_findings=None):
     file_list = "\n".join(f"- {f}" for f in files) if files else "(no files)"
+    static_text = format_static_findings(static_findings or [])
     return textwrap.dedent(f"""\
         Review the following code changes ({source}).
 
@@ -482,6 +484,9 @@ def _build_review_prompt(diff, source, files):
         {diff}
         ```
 
+        Static findings:
+        {static_text}
+
         Analyze for:
         - Logic errors and potential bugs
         - Security vulnerabilities (injection, path traversal, secret leaks, etc.)
@@ -491,8 +496,38 @@ def _build_review_prompt(diff, source, files):
 
         Group findings by severity: critical > warning > suggestion.
         For each finding, reference the specific file and line.
+        Treat static findings as evidence to triage, not guaranteed bugs.
+        For each static finding, say whether it looks real, a false positive, or needs a regression test.
         If the changes look good, say so briefly.
     """).strip()
+
+
+def _static_finding_dicts(static_findings):
+    return [finding.to_dict() for finding in static_findings or []]
+
+
+def _record_review_static_findings(agent, static_findings, source, files):
+    task_state = getattr(agent, "current_task_state", None)
+    if task_state is None:
+        return
+    payload = {
+        "source": source,
+        "files": list(files or []),
+        "count": len(static_findings or []),
+        "findings": _static_finding_dicts(static_findings),
+    }
+    agent.emit_trace(task_state, "review_static_findings", payload)
+    try:
+        report = agent.run_store.load_report(task_state)
+    except Exception:
+        report = {}
+    report["review"] = {
+        **dict(report.get("review", {}) if isinstance(report.get("review"), dict) else {}),
+        "source": source,
+        "files": list(files or []),
+        "static_findings": payload["findings"],
+    }
+    agent.run_store.write_report(task_state, agent.redact_artifact(report))
 
 
 def _handle_review(agent, target):
@@ -548,17 +583,25 @@ def _handle_review(agent, target):
         print("No pending changes to review.")
         return
 
+    static_findings = scan_python_files(files, ws.repo_root)
     print(f"\nReviewing: {source}")
     if files:
         for f in files[:20]:
             print(f"  - {f}")
         if len(files) > 20:
             print(f"  ... and {len(files) - 20} more")
+    if static_findings:
+        print(f"Static findings: {len(static_findings)}")
+        for finding in static_findings[:10]:
+            print(f"  - {finding.rule_id} {finding.file}:{finding.line} [{finding.severity}]")
+        if len(static_findings) > 10:
+            print(f"  ... and {len(static_findings) - 10} more")
     print()
 
-    prompt = _build_review_prompt(diff_text, source, files)
+    prompt = _build_review_prompt(diff_text, source, files, static_findings)
     try:
         result = agent.ask(prompt)
+        _record_review_static_findings(agent, static_findings, source, files)
         print(result)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)

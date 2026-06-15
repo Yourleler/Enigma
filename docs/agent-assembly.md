@@ -15,7 +15,7 @@
 | **Plan 模式** | 只读探索→结构化计划→内联审批（approve/revise/reject），模仿 Claude Code | 2.8 节 |
 | **工具安全护栏** | 7 层流水线：存在性→校验→重复检测→审批→快照→执行→记忆更新，路径穿越防护 | 2.4、3.6 节 |
 | **Skill 系统** | 三源发现（内置/用户/项目）、渐进加载、模板变量替换 | 2.10 节 |
-| **代码审查命令** | `/review` 四种输入模式（自动检测/PR 链接/分支对比/指定文件），severity 分组，WorkspaceContext 封装 git diff | 1.5 节 |
+| **代码审查命令** | `/review` 四种输入模式 + 轻量 AST 静态 finding，结构化结果进入 LLM triage、trace 和 report | 1.5 节 |
 | **终端 UX** | 双线程 REPL、spinner + 暂存消息队列、Ctrl+C 中断、文件 diff 红绿显示、流式 token 输出 | 2.9 节 |
 | **BM25 记忆检索** | 零依赖，分路排序（情景+语义各保底 2 条），不用 embedding | 5.7 节 |
 | **会话恢复** | Checkpoint 链表 + 文件 freshness + runtime_identity 五维状态评估 | 第七章 |
@@ -299,7 +299,7 @@ REPL 使用双线程架构（`enigma/repl.py`）：主线程处理键盘输入�
 - `/reset` — 清除会话
 - `/compact [focus]` — 压缩上下文
 - `/plan <task>` — 进入 Plan 模式
-- `/review [target]` — 代码审查（支持 PR 链接、分支对比、指定文件、自动检测）
+- `/review [target]` — 代码审查（支持 PR 链接、分支对比、指定文件、自动检测；Python 文件会先产出轻量 AST 静态 finding）
 - `/skills` — 列出可用 Skill
 - `/<skill-name> [args]` — 调用 Skill
 - `/exit` — 退出
