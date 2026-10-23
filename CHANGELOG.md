@@ -8,5 +8,6 @@
 - 统一持久化脱敏，原子保存 session，限制 session id 和 benchmark 工具能力。
 - 支持 shell 进程组取消、结构化超时状态和中文记忆召回。
 - 增加稳定性回归、本地 HTTP 完整链路测试、固定开发检查与多平台 CI。
+- 修复 CI 暴露的 Python 3.10 UTC/时间戳兼容、Windows 默认时区数据缺失，以及测试的 locale/UTF-8 平台假设。
 
 详细行为与执行边界见 [稳定基线说明](docs/stabilization.md)。

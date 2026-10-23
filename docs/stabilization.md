@@ -47,6 +47,8 @@
 
 开发依赖固定为 pytest 9.1.1 和 Ruff 0.17.2，Ruff 规则在项目配置中固定，避免继承机器设置。CI 配置 Python 3.10/3.12 和 Linux/macOS/Windows，实际远端结果需在推送后观察。
 
+首次远端矩阵运行暴露了 Python 3.10 不支持 `datetime.UTC`、Windows 缺少 IANA 时区数据，以及测试假定固定 locale/默认 UTF-8 的问题。指标模块使用 `timezone.utc` 并兼容 `Z` 时间戳；默认上海当前时间在无时区数据库时使用 UTC+08:00，其他指定时区仍要求有效数据库。测试按实际 locale 和明确 UTF-8 编码检查，保留全部六个 CI 组合。
+
 ```bash
 .venv/bin/python -m ruff check .
 .venv/bin/python -m pytest -q
@@ -56,3 +58,5 @@
 本次本机使用 Python 3.12.14。真实模型联调需要配置并启动 Ollama 或相应兼容 API 后端。
 
 2026-10-23 本机最终确认：287 个测试全部通过，Ruff 检查、安装后的 `enigma --help` 和 `git diff --check` 均通过。原有 242 个测试保留，并新增 45 个稳定性回归用例。真实模型后端未参与这次验收，受控 HTTP 链路验证的是客户端、工具与验收流程。
+
+推送后的兼容性修复新增两项回归：本机 Python 3.10 和 3.12 各 289 项全部通过，Ruff、两个版本的 `python -m enigma --help` 和 `git diff --check` 也通过。

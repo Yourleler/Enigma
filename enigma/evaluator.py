@@ -4,9 +4,9 @@ import locale as locale_module
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import memory as memorylib
 from .models import FakeModelClient
@@ -127,7 +127,14 @@ def _current_locale():
 
 
 def _now_in_timezone(timezone_name):
-    return datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        if timezone_name != DEFAULT_TIMEZONE:
+            raise
+        # Current Shanghai timestamps use UTC+08:00, including on hosts without IANA data.
+        zone = timezone(timedelta(hours=8), name=DEFAULT_TIMEZONE)
+    return datetime.now(zone).strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def _artifact_path_for_task(task):

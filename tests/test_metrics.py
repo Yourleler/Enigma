@@ -1,9 +1,25 @@
+from datetime import timedelta
+
 from enigma.metrics import (
+    _infer_run_duration_ms,
+    _parse_iso8601,
+    _utc_timestamp,
     run_context_ablation_v2,
     run_memory_ablation_v2,
     run_recovery_ablation_v2,
     write_benchmark_core_report,
 )
+
+
+def test_metrics_timestamp_round_trip_and_legacy_duration():
+    timestamp = _utc_timestamp()
+    assert timestamp.endswith("Z")
+    assert _parse_iso8601(timestamp).utcoffset() == timedelta(0)
+    events = [
+        {"event": "run_started", "created_at": "2026-10-23T00:00:00Z"},
+        {"event": "run_finished", "created_at": "2026-10-23T00:00:01.250Z"},
+    ]
+    assert _infer_run_duration_ms(events) == 1250.0
 
 
 def test_run_context_ablation_v2_writes_expected_artifact(tmp_path):

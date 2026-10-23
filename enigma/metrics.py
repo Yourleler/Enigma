@@ -2,7 +2,7 @@ import json
 import os
 import tempfile
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .evaluator import run_fixed_benchmark
@@ -19,7 +19,7 @@ DEFAULT_CORE_REPORT_PATH = Path("docs/metrics/enigma-benchmark-core-report.md")
 
 
 def _utc_timestamp():
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _safe_mean(values):
@@ -39,7 +39,10 @@ def _parse_iso8601(value):
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value))
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
     except Exception:
         return None
 

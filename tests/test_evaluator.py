@@ -1,9 +1,13 @@
 import json
+import locale
 from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfoNotFoundError
 
 import pytest
 
+from enigma import evaluator as evaluator_module
 from enigma.evaluator import (
     BenchmarkEvaluator,
     load_benchmark,
@@ -115,7 +119,7 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
         "max_new_tokens": 64,
     }
     assert reproducibility["timezone"] == "Asia/Shanghai"
-    assert reproducibility["locale"] == "C.UTF-8"
+    assert reproducibility["locale"] == locale.setlocale(locale.LC_CTYPE)
 
     for row in artifact["rows"]:
         assert not row["fixture_copy_relpath"].startswith("/")
@@ -129,6 +133,17 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
         assert row["expected_artifact_exists"] is True
         assert row["non_failure_stop_reason"] is True
         assert row["stop_reason"] == "final_answer_returned"
+
+
+def test_default_benchmark_timezone_without_system_timezone_data(monkeypatch):
+    def missing_zone(name):
+        raise ZoneInfoNotFoundError(name)
+
+    monkeypatch.setattr(evaluator_module, "ZoneInfo", missing_zone)
+    captured_at = datetime.strptime(evaluator_module._now_in_timezone("Asia/Shanghai"), "%Y-%m-%dT%H:%M:%S%z")
+    assert captured_at.utcoffset() == timedelta(hours=8)
+    with pytest.raises(ZoneInfoNotFoundError):
+        evaluator_module._now_in_timezone("Unknown/Zone")
 
 
 def test_run_fixed_benchmark_covers_recovery_and_durable_contract_rows(tmp_path):

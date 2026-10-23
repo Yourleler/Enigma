@@ -27,7 +27,7 @@ def test_xml_delimiters_survive_actual_write(tmp_path, content):
     request = f'<tool name="write_file" path="literal.txt"><content>{content}</content></tool>'
     agent = agent_at(tmp_path, [request, '<final>Written.</final>'])
     agent.ask("Write the exact literal")
-    assert (tmp_path / 'literal.txt').read_text() == content
+    assert (tmp_path / 'literal.txt').read_text(encoding='utf-8') == content
 
 
 def test_plain_progress_cannot_finish_a_task(tmp_path):
@@ -49,8 +49,8 @@ def test_model_failure_persists_terminal_state_and_report(tmp_path):
     agent = agent_at(tmp_path, [])
     with pytest.raises(RuntimeError):
         agent.ask('Fail the provider')
-    state = json.loads(agent.run_store.task_state_path(agent.current_task_state).read_text())
-    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text())
+    state = json.loads(agent.run_store.task_state_path(agent.current_task_state).read_text(encoding='utf-8'))
+    report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding='utf-8'))
     assert state['status'] == report['status'] == 'failed'
     assert state['stop_reason'] == 'model_error'
 
@@ -173,7 +173,7 @@ def test_reserved_xml_tags_inside_content_are_not_arguments(tmp_path):
     content = '<path>../escape</path>\n<command>bad</command>'
     agent = agent_at(tmp_path, [f'<tool name="write_file" path="literal.txt"><content>{content}</content></tool>', '<final>Written.</final>'])
     agent.ask('Write exact content')
-    assert (tmp_path / 'literal.txt').read_text() == content
+    assert (tmp_path / 'literal.txt').read_text(encoding='utf-8') == content
     assert Enigma.parse('<tool name="write_file" path="a"><content>a</content></tool><tool name="write_file" path="b"><content>b</content></tool>')[0] == 'retry'
 
 
