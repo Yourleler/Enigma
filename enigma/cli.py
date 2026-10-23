@@ -6,6 +6,7 @@
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -267,6 +268,12 @@ def build_agent(args):
             show_token_usage=True,
         )
     agent.skills = discover_skills(workspace.repo_root, user_home)
+    if getattr(args, "verify_command", None):
+        def check_completion(active_agent):
+            result = active_agent.run_tool("run_shell", {"command": args.verify_command, "timeout": 120}, check_repetition=False)
+            metadata = dict(active_agent._last_tool_result_metadata)
+            return metadata.get("tool_status") == "ok", {"result": result, **metadata}
+        agent.completion_check = check_completion
     # 启动时确保 MEMORY.md 存在（不存在就写一份骨架）。
     # 放在 CLI 层而不是 Enigma 构造里，避免测试临时目录意外生成文件。
     memory_store = getattr(agent.memory, "durable_store", None)
@@ -298,14 +305,15 @@ def build_arg_parser():
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument("--plan", action="store_true", default=False, help="Plan mode: explore read-only first, produce plan, execute after approval.")
     parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
+    parser.add_argument("--verify-command", default=None, help="Approved shell check required before reporting a verified result.")
     parser.add_argument(
         "--secret-env-name",
         dest="secret_env_names",
         action="append",
         default=[],
-        help="Extra environment variable names to treat as secrets for trace/report redaction.",
+        help="Extra environment variable names protected in persisted session, memory, and runtime artifacts.",
     )
-    parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
+    parser.add_argument("--max-steps", type=int, default=6, help="Maximum model-requested tool calls; bounded final/retry rounds are allowed.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
@@ -375,11 +383,12 @@ def main(argv=None):
                     if isinstance(result, PlanResult):
                         handle_plan_approval(agent, result.plan, prompt)
                     else:
-                        print(result)
-            except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
+                        print_answer(agent, result)
+            except (Exception, KeyboardInterrupt) as exc:
+                print(agent.redact_text(str(exc)) or "Stopped by user.", file=sys.stderr)
                 return 1
-        return 0
+        state = agent.current_task_state
+        return 1 if state is not None and state.status in {"failed", "stopped"} else 0
 
     spinner = repl.Spinner()
     pending_message = ""
@@ -406,19 +415,18 @@ def main(argv=None):
             continue
 
         # 运行 agent，支持 spinner + 暂存消息 + 中断
-        # 工作线程中 approve() 的 input() 会跟主线程的 msvcrt 争抢 stdin，
-        # 所以临时切换为 auto 审批，完成后恢复。
+        # The main thread owns stdin, including tool approval dialogs.
         result_box = [None]
         error_box = [None]
-        saved_approval = agent.approval_policy
-        if saved_approval == "ask":
-            agent.approval_policy = "auto"
+        broker = repl.ApprovalBroker(lambda: agent._cancel_requested)
+        saved_callback = agent.approval_callback
+        agent.approval_callback = broker.request
 
-        def run_agent():
+        def run_agent(user_input=user_input, result_box=result_box, error_box=error_box):
             try:
                 r = agent.ask(user_input)
                 result_box[0] = r
-            except Exception as exc:
+            except (Exception, KeyboardInterrupt) as exc:
                 error_box[0] = exc
 
         worker = threading.Thread(target=run_agent, daemon=True)
@@ -427,47 +435,74 @@ def main(argv=None):
         pending_message = ""
 
         # 非阻塞输入循环：读键盘，管理暂存消息
-        while worker.is_alive():
-            try:
-                ch = repl.read_key_nonblocking()
-                if ch is not None:
-                    if ch == "\x1b":  # Esc → 清除暂存消息
-                        if pending_message:
-                            pending_message = ""
-                            repl.draw_pending_message("", sys.stderr)
-                    elif ch == "\r" or ch == "\n":
-                        pass  # 忽略回车，等 agent 完成后自动发送
-                    elif ch == "\x03":  # Ctrl+C → 中断 agent
+        keys = repl.KeyInput()
+        try:
+            with keys:
+                while worker.is_alive():
+                    try:
+                        request = broker.pending()
+                        if request is not None:
+                            spinner.stop()
+                            try:
+                                with keys.cooked():
+                                    answer = input(f"approve {request.name} {json.dumps(request.args)}? [y/N] ")
+                                request.decision = answer.strip().lower() in {"y", "yes"}
+                            except (EOFError, KeyboardInterrupt):
+                                agent.request_cancel()
+                            finally:
+                                request.ready.set()
+                            spinner.start()
+                            continue
+                        ch = repl.read_key_nonblocking()
+                        if ch is not None:
+                            if ch == "\x1b":  # Esc → 清除暂存消息
+                                if pending_message:
+                                    pending_message = ""
+                                    repl.draw_pending_message("", sys.stderr)
+                            elif ch == "\r" or ch == "\n":
+                                pass  # 忽略回车，等 agent 完成后自动发送
+                            elif ch == "\x03":  # Ctrl+C → 中断 agent
+                                agent.request_cancel()
+                            elif ch == "\x7f" or ch == "\b":  # Backspace
+                                if pending_message:
+                                    pending_message = pending_message[:-1]
+                                    repl.draw_pending_message(pending_message, sys.stderr)
+                            elif ch.isprintable():
+                                pending_message += ch
+                                repl.draw_pending_message(pending_message, sys.stderr)
+                        else:
+                            import time as _time
+                            _time.sleep(0.05)
+                    except KeyboardInterrupt:
                         agent.request_cancel()
-                    elif ch == "\x7f" or ch == "\b":  # Backspace
-                        if pending_message:
-                            pending_message = pending_message[:-1]
-                            repl.draw_pending_message(pending_message, sys.stderr)
-                    elif ch.isprintable():
-                        pending_message += ch
-                        repl.draw_pending_message(pending_message, sys.stderr)
-                else:
-                    import time as _time
-                    _time.sleep(0.05)
-            except KeyboardInterrupt:
-                agent.request_cancel()
-                break
+                        break
 
-        spinner.stop()
-        worker.join()
-        agent.approval_policy = saved_approval
+        finally:
+            spinner.stop()
+            broker.close()
+            if worker.is_alive():
+                agent.request_cancel()
+            worker.join()
+            agent.approval_callback = saved_callback
 
         # 显示结果
         if error_box[0] is not None:
-            print(str(error_box[0]), file=sys.stderr)
+            print(agent.redact_text(str(error_box[0])) or "Stopped by user.", file=sys.stderr)
         elif result_box[0] is not None:
             r = result_box[0]
             if isinstance(r, PlanResult):
                 handle_plan_approval(agent, r.plan, user_input)
             else:
-                print(r)
+                print_answer(agent, r)
 
         # 暂存消息在下一轮 input() 返回空时自动发送（line 377-379）
+
+
+def print_answer(agent, answer):
+    print(answer)
+    state = agent.current_task_state
+    if state is not None and state.status == "completed":
+        print(f"Verification: {state.verification_status}")
 
 
 def _build_review_prompt(diff, source, files, static_findings=None):

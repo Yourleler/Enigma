@@ -10,9 +10,10 @@ from zoneinfo import ZoneInfo
 
 from . import memory as memorylib
 from .models import FakeModelClient
-from .runtime import Enigma, SessionStore
 from .run_store import RunStore
+from .runtime import Enigma, SessionStore
 from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED
+from .tools import run_shell_process
 from .workspace import WorkspaceContext
 
 BENCHMARK_SCHEMA_VERSION = 1
@@ -382,6 +383,7 @@ class BenchmarkEvaluator:
         max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
         timezone_name=DEFAULT_TIMEZONE,
         model_client_factory=None,
+        verifier_timeout=30,
     ):
         self.benchmark_path = Path(benchmark_path)
         self.artifact_path = Path(artifact_path)
@@ -395,6 +397,9 @@ class BenchmarkEvaluator:
         self.max_new_tokens = max_new_tokens
         self.timezone_name = timezone_name
         self.model_client_factory = model_client_factory
+        if verifier_timeout <= 0:
+            raise ValueError("verifier_timeout must be positive")
+        self.verifier_timeout = verifier_timeout
         self.repo_root = self.benchmark_path.resolve().parent.parent
 
     def load(self):
@@ -463,6 +468,7 @@ class BenchmarkEvaluator:
             approval_policy="auto",
             max_steps=int(task["step_budget"]),
             max_new_tokens=self.max_new_tokens,
+            allowed_tools=task["allowed_tools"],
         )
         _apply_task_setup(agent, task, fixture_copy_root)
 
@@ -484,24 +490,30 @@ class BenchmarkEvaluator:
         expected_artifact_exists = artifact_file.exists()
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
-        verifier = subprocess.run(
-            task["verifier"],
-            cwd=fixture_copy_root,
-            shell=True,
-            capture_output=True,
-            text=True,
+        verifier, verifier_outcome = run_shell_process(
+            task["verifier"], cwd=fixture_copy_root, env=agent.shell_env(),
+            timeout=self.verifier_timeout, executable=agent.shell_executable(),
         )
+        if verifier_outcome["timed_out"]:
+            verifier.returncode = 124
+            verifier.stderr += "\nverifier timed out"
 
         within_budget = task_state.tool_steps <= int(task["step_budget"])
         verifier_passed = verifier.returncode == 0
         non_failure_stop_reason = task_state.stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED
-        passed = within_budget and verifier_passed and expected_artifact_exists and non_failure_stop_reason
+        allowed_tools_compliant = all(
+            item.get("name") in task["allowed_tools"]
+            for item in agent.session["history"] if item.get("role") == "tool"
+        )
+        passed = within_budget and verifier_passed and expected_artifact_exists and non_failure_stop_reason and allowed_tools_compliant
         failure_category = None if passed else self._failure_category(
             within_budget=within_budget,
             verifier_passed=verifier_passed,
             expected_artifact_exists=expected_artifact_exists,
             non_failure_stop_reason=non_failure_stop_reason,
         )
+        if not allowed_tools_compliant:
+            failure_category = "tool_policy_violation"
 
         return {
             "id": task["id"],
@@ -513,6 +525,7 @@ class BenchmarkEvaluator:
             "task_state_relpath": _workspace_relative(task_state_path, self.workspace_root),
             "report_relpath": _workspace_relative(report_path, self.workspace_root),
             "allowed_tools": list(task["allowed_tools"]),
+            "allowed_tools_compliant": allowed_tools_compliant,
             "step_budget": int(task["step_budget"]),
             "expected_artifact": task["expected_artifact"],
             "artifact_path": artifact_path,
@@ -520,6 +533,7 @@ class BenchmarkEvaluator:
             "artifact_digest": artifact_digest,
             "verifier": task["verifier"],
             "verifier_exit_code": verifier.returncode,
+            "verifier_timed_out": verifier_outcome["timed_out"],
             "verifier_stdout": verifier.stdout,
             "verifier_stderr": verifier.stderr,
             "category": task["category"],

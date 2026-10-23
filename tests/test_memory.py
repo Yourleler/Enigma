@@ -260,7 +260,7 @@ def test_durable_memory_retrieval_uses_applies_when(tmp_path):
 
 
 def test_promote_respects_topic_note_limit(tmp_path):
-    from enigma.memory import DurableMemoryStore, TOPIC_NOTE_LIMIT
+    from enigma.memory import TOPIC_NOTE_LIMIT, DurableMemoryStore
 
     memory_root = tmp_path / ".enigma" / "memory"
     memory_root.mkdir(parents=True)
@@ -282,7 +282,7 @@ def test_promote_respects_topic_note_limit(tmp_path):
 
 
 def test_promote_replacement_not_counted_against_limit(tmp_path):
-    from enigma.memory import DurableMemoryStore, TOPIC_NOTE_LIMIT
+    from enigma.memory import TOPIC_NOTE_LIMIT, DurableMemoryStore
 
     memory_root = tmp_path / ".enigma" / "memory"
     memory_root.mkdir(parents=True)
@@ -304,7 +304,7 @@ def test_promote_replacement_not_counted_against_limit(tmp_path):
 
 
 def test_replace_topics_clips_to_limit(tmp_path):
-    from enigma.memory import DurableMemoryStore, TOPIC_NOTE_LIMIT
+    from enigma.memory import TOPIC_NOTE_LIMIT, DurableMemoryStore
 
     memory_root = tmp_path / ".enigma" / "memory"
     memory_root.mkdir(parents=True)

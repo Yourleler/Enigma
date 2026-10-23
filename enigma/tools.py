@@ -5,10 +5,13 @@
 """
 
 import fnmatch
+import os
 import re
 import shutil
+import signal
 import subprocess
 import textwrap
+import time
 from functools import partial
 
 from . import web_search
@@ -48,7 +51,7 @@ BASE_TOOL_SPECS = {
     "run_shell": {
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
-        "description": "Run a shell command in the repo root.",
+        "description": "Run an approved shell command from the repo root. Host filesystem access is unrestricted; cwd is not a sandbox.",
     },
     "write_file": {
         "schema": {"path": "str", "content": "str"},
@@ -390,6 +393,71 @@ def tool_web_search(agent, args):
     return clip("\n".join(lines))
 
 
+def _terminate_process_group(process):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                       capture_output=True, timeout=5, check=False)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def run_shell_process(command, *, cwd, env, timeout, executable=None, cancelled=None):
+    """Shared bounded process runner for agent tools and independent graders."""
+    run_kwargs = {}
+    shell_executable = executable
+    if shell_executable:
+        run_kwargs["executable"] = shell_executable
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=os.name != "nt",
+        # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
+        # 目的是减少敏感信息被意外带进命令执行环境的风险。
+        env=env,
+        **run_kwargs,
+    )
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    aborted = False
+    try:
+        while True:
+            aborted = bool(cancelled and cancelled())
+            timed_out = time.monotonic() >= deadline
+            if aborted or timed_out:
+                _terminate_process_group(process)
+                stdout, stderr = process.communicate()
+                break
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, max(0.01, deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        _terminate_process_group(process)
+        process.wait()
+        raise
+    finally:
+        if process.poll() is None:
+            _terminate_process_group(process)
+            process.wait()
+    outcome = {
+        "exit_code": process.returncode, "timed_out": timed_out,
+        "aborted": aborted, "confinement": "unrestricted",
+    }
+    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    return result, outcome
+
+
 def tool_run_shell(agent, args):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -397,25 +465,16 @@ def tool_run_shell(agent, args):
     timeout = int(args.get("timeout", 20))
     if timeout < 1 or timeout > 120:
         raise ValueError("timeout must be in [1, 120]")
-    run_kwargs = {}
-    shell_executable = getattr(agent, "shell_executable", lambda: None)()
-    if shell_executable:
-        run_kwargs["executable"] = shell_executable
-    result = subprocess.run(
-        command,
-        cwd=agent.root,
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
-        # 目的是减少敏感信息被意外带进命令执行环境的风险。
-        env=agent.shell_env(),
-        **run_kwargs,
+    result, outcome = run_shell_process(
+        command, cwd=agent.root, env=agent.shell_env(), timeout=timeout,
+        executable=agent.shell_executable(), cancelled=lambda: agent._cancel_requested,
     )
+    agent._shell_outcome = outcome
     return textwrap.dedent(
         f"""\
         exit_code: {result.returncode}
+        timed_out: {outcome['timed_out']}
+        aborted: {outcome['aborted']}
         stdout:
         {result.stdout.strip() or "(empty)"}
         stderr:
@@ -472,6 +531,7 @@ def tool_delegate(agent, args):
         secret_env_names=agent.secret_env_names,
         shell_env_allowlist=agent.shell_env_allowlist,
         feature_flags=dict(agent.feature_flags),
+        allowed_tools=agent.allowed_tools,
     )
     # 委派的目标是“调查”，不是“放权执行”。
     # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。

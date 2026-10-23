@@ -69,9 +69,11 @@ def test_orchestrate_normal_plan_execute_review_done(tmp_path):
         tmp_path,
         [
             "<plan>\n## Steps\n1. Inspect README\n</plan>",
+            '<tool>{"name":"read_file","args":{"path":"README.md"}}</tool>',
             "<final>Executor completed the active step.</final>",
             "<final>No findings.</final>",
         ],
+        completion_check=lambda agent: (any(item.get("name") == "read_file" for item in agent.session["history"]), {"read": "README.md"}),
     )
 
     result = agent.orchestrate("Inspect README")
@@ -95,9 +97,13 @@ def test_orchestrate_execution_failure_enters_repair_plan(tmp_path):
             "<plan>\n## Steps\n1. Patch README\n</plan>",
             "<final>error: patch failed</final>",
             "<plan>\n## Steps\n1. Read README before patching\n</plan>",
+            '<tool>{"name":"read_file","args":{"path":"README.md"}}</tool>',
+            '<tool>{"name":"patch_file","args":{"path":"README.md","old_text":"demo","new_text":"updated"}}</tool>',
             "<final>Executor completed repair.</final>",
+            "<final>Original step verified after repair.</final>",
             "<final>No findings.</final>",
         ],
+        completion_check=lambda agent: ((agent.root / "README.md").read_text() == "updated\n", {"expected": "updated"}),
     )
 
     result = agent.orchestrate("Patch README")
@@ -114,12 +120,15 @@ def test_orchestrate_review_finding_blocks_done_until_repair(tmp_path):
         tmp_path,
         [
             "<plan>\n## Steps\n1. Update README\n</plan>",
+            '<tool>{"name":"patch_file","args":{"path":"README.md","old_text":"demo","new_text":"updated"}}</tool>',
             "<final>Executor completed the active step.</final>",
             "<final>critical: README update missed the acceptance check.</final>",
             "<plan>\n## Steps\n1. Add the missing acceptance check\n</plan>",
+            '<tool>{"name":"patch_file","args":{"path":"README.md","old_text":"updated","new_text":"updated and checked"}}</tool>',
             "<final>Executor completed repair.</final>",
             "<final>No findings.</final>",
         ],
+        completion_check=lambda agent: ((agent.root / "README.md").read_text().startswith("updated"), {"expected": "updated"}),
     )
 
     result = agent.orchestrate("Update README")
@@ -158,12 +167,18 @@ def test_reviewer_role_uses_read_only_tool_surface(tmp_path):
         ],
     )
 
-    agent.orchestrate("Inspect README")
-
-    reviewer_prompt = next(prompt for prompt in agent.model_client.prompts if "Reviewer role:" in prompt)
-    assert "write_file" not in reviewer_prompt
-    assert "patch_file" not in reviewer_prompt
-    assert "run_shell" not in reviewer_prompt
+    original_complete = agent.model_client.complete
+    observed = []
+    def complete(prompt, tokens, **kwargs):
+        if agent.read_only and "Reviewer role:" in prompt:
+            observed.append(set(agent.tools))
+            assert agent.run_tool("write_file", {"path": "forbidden.txt", "content": "x"}).startswith("error:")
+        return original_complete(prompt, tokens, **kwargs)
+    with patch.object(agent.model_client, "complete", side_effect=complete):
+        agent.orchestrate("Inspect README")
+    assert observed
+    assert not {"write_file", "patch_file", "run_shell"} & observed[0]
+    assert not (tmp_path / "forbidden.txt").exists()
 
 
 def test_orchestrate_static_critical_finding_blocks_done(tmp_path):

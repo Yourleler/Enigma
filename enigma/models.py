@@ -5,11 +5,13 @@ runtime 只关心一件事：给我一个 prompt，我拿回一段文本。
 这些差异都在这里被抹平成统一的 complete() 接口。
 """
 
+import codecs
+import io
 import json
 import time
-from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
+from http.client import RemoteDisconnected
 
 # 模型上下文窗口映射（前缀匹配，小写，最长前缀优先）
 MODEL_CONTEXT_WINDOWS = {
@@ -210,6 +212,7 @@ class OllamaModelClient:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 if on_token:
                     full_text = ""
+                    completed = False
                     for line in response:
                         line = line.decode("utf-8").strip()
                         if not line:
@@ -217,13 +220,18 @@ class OllamaModelClient:
                         try:
                             chunk = json.loads(line)
                         except json.JSONDecodeError:
-                            continue
+                            raise RuntimeError("Malformed Ollama stream") from None
+                        if chunk.get("error"):
+                            raise RuntimeError(f"Ollama stream failed: {chunk['error']}")
                         token = chunk.get("response", "")
                         if token:
                             full_text += token
                             on_token(token)
                         if chunk.get("done"):
+                            completed = True
                             break
+                    if not completed:
+                        raise RuntimeError("Ollama stream ended before completion")
                     return full_text
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
@@ -276,95 +284,80 @@ def _extract_openai_text(data):
     return ""
 
 
-def _extract_openai_text_from_sse(body_text):
-    last_response = None
-    deltas = []
-    for line in body_text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            event = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        event_type = event.get("type", "")
-        if event_type == "response.output_text.delta":
-            delta = event.get("delta")
+def _sse_events(response):
+    """Incrementally decode UTF-8 and preserve the last unterminated line."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    buffer = ""
+    event_name = ""
+    pending = ""
+    while True:
+        chunk = response.read(4096)
+        buffer += decoder.decode(chunk, final=not chunk)
+        if not chunk and buffer and not buffer.endswith("\n"):
+            buffer += "\n"
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.rstrip("\r")
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    yield {"type": "stream.done"}
+                    continue
+                pending += payload + "\n"
+                try:
+                    event = json.loads(pending)
+                except json.JSONDecodeError:
+                    continue
+                pending = ""
+                if not isinstance(event, dict):
+                    raise RuntimeError("SSE data must be an object")
+                event.setdefault("type", event_name)
+                yield event
+            elif not line and pending:
+                raise RuntimeError("Malformed SSE event")
+        if not chunk:
+            if pending:
+                raise RuntimeError("Truncated SSE event")
+            break
+
+
+def _collect_openai_stream(response, on_token=None):
+    parts = []
+    final_text = ""
+    last_response = {}
+    completed = False
+    for event in _sse_events(response):
+        kind = event.get("type", "")
+        if kind in {"error", "response.failed", "response.incomplete"}:
+            raise RuntimeError(f"OpenAI stream failed: {event}")
+        current = event.get("response")
+        if isinstance(current, dict):
+            last_response = current
+            if current.get("status") in {"failed", "incomplete"} or current.get("error"):
+                raise RuntimeError(f"OpenAI response failed: {current}")
+        if kind == "response.output_text.delta":
+            delta = event.get("delta", "")
             if isinstance(delta, str):
-                deltas.append(delta)
-            continue
-        if event_type == "response.output_text.done":
-            text = event.get("text")
-            if isinstance(text, str) and text:
-                return text
-        part = event.get("part")
-        if isinstance(part, dict):
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                return text
-        item = event.get("item")
-        if isinstance(item, dict):
-            text = _extract_openai_text({"output": [item]})
-            if text:
-                return text
-        response = event.get("response")
-        if isinstance(response, dict):
-            last_response = response
-            text = _extract_openai_text(response)
-            if text:
-                return text
-        text = _extract_openai_text(event)
-        if text:
-            return text
-    if deltas:
-        return "".join(deltas)
-    if isinstance(last_response, dict):
-        return _extract_openai_text(last_response)
-    return ""
+                parts.append(delta)
+                if on_token and delta:
+                    on_token(delta)
+        elif kind == "response.output_text.done":
+            final_text = str(event.get("text") or final_text)
+        elif kind in {"response.completed", "stream.done"}:
+            completed = True
+    if not completed:
+        raise RuntimeError("OpenAI stream ended before completion")
+    return _extract_openai_text(last_response) or final_text or "".join(parts), last_response
+
+
+def _extract_openai_text_from_sse(body_text):
+    return _extract_openai_response_from_sse(body_text)[0]
 
 
 def _extract_openai_response_from_sse(body_text):
-    last_response = None
-    deltas = []
-    for line in body_text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            event = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        response = event.get("response")
-        if isinstance(response, dict):
-            last_response = response
-            if event.get("type") == "response.completed":
-                text = _extract_openai_text(response)
-                if text:
-                    return text, response
-        event_type = event.get("type", "")
-        if event_type == "response.output_text.delta":
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                deltas.append(delta)
-        elif event_type == "response.output_text.done":
-            text = event.get("text")
-            if isinstance(text, str) and text:
-                return text, last_response or {}
-        else:
-            text = _extract_openai_text(event)
-            if text:
-                return text, event
-    if deltas:
-        return "".join(deltas), last_response or {}
-    if isinstance(last_response, dict):
-        return _extract_openai_text(last_response), last_response
-    return "", {}
+    return _collect_openai_stream(io.BytesIO(body_text.encode("utf-8")))
 
 
 def _extract_usage_cache_details(data):
@@ -500,6 +493,8 @@ class OpenAICompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
+        if data.get("status") in {"failed", "incomplete"}:
+            raise RuntimeError(f"OpenAI-compatible response is {data['status']}")
         self.last_completion_metadata = {
             "prompt_cache_supported": self.supports_prompt_cache,
             "prompt_cache_key": prompt_cache_key,
@@ -509,50 +504,14 @@ class OpenAICompatibleModelClient:
         return _extract_openai_text(data)
 
     def _stream_openai_response(self, response, on_token, prompt_cache_key, prompt_cache_retention):
-        full_text = ""
-        last_response = None
-        buffer = ""
-        while True:
-            chunk = response.read(4096)
-            if not chunk:
-                break
-            buffer += chunk.decode("utf-8")
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                payload = line[len("data:"):].strip()
-                if not payload or payload == "[DONE]":
-                    continue
-                try:
-                    event = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                event_type = event.get("type", "")
-                if event_type == "response.output_text.delta":
-                    delta = event.get("delta", "")
-                    if isinstance(delta, str) and delta:
-                        full_text += delta
-                        on_token(delta)
-                elif event_type == "response.completed":
-                    resp = event.get("response")
-                    if isinstance(resp, dict):
-                        last_response = resp
-                elif event_type == "response.output_text.done":
-                    pass
-                else:
-                    resp = event.get("response")
-                    if isinstance(resp, dict):
-                        last_response = resp
-        if isinstance(last_response, dict) and last_response:
-            self.last_completion_metadata = {
-                "prompt_cache_supported": self.supports_prompt_cache,
-                "prompt_cache_key": prompt_cache_key,
-                "prompt_cache_retention": prompt_cache_retention,
-                **_extract_usage_cache_details(last_response),
-            }
-        return full_text
+        text, data = _collect_openai_stream(response, on_token)
+        self.last_completion_metadata = {
+            "prompt_cache_supported": self.supports_prompt_cache,
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_retention": prompt_cache_retention,
+            **_extract_usage_cache_details(data),
+        }
+        return text
 
 
 def _extract_anthropic_text(data):
@@ -642,41 +601,29 @@ class AnthropicCompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
+        if data.get("stop_reason") == "max_tokens":
+            raise RuntimeError("Anthropic response was truncated at max_tokens")
         text = _extract_anthropic_text(data)
         if text:
             return text
         raise RuntimeError("Anthropic-compatible error: could not extract text from response")
 
     def _stream_anthropic_response(self, response, on_token):
-        full_text = ""
-        buffer = ""
-        current_event = ""
-        while True:
-            chunk = response.read(4096)
-            if not chunk:
-                break
-            buffer += chunk.decode("utf-8")
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.rstrip("\r")
-                if line.startswith("event:"):
-                    current_event = line[len("event:"):].strip()
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[len("data:"):].strip()
-                if not data_str:
-                    continue
-                try:
-                    event = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                if current_event == "content_block_delta":
-                    delta = event.get("delta", {})
-                    text = delta.get("text", "")
-                    if text:
-                        full_text += text
-                        on_token(text)
-                elif current_event == "message_stop":
-                    pass
-        return full_text
+        parts = []
+        completed = False
+        for event in _sse_events(response):
+            kind = event.get("type", "")
+            if kind == "error":
+                raise RuntimeError(f"Anthropic stream failed: {event.get('error', event)}")
+            if kind == "message_delta" and event.get("delta", {}).get("stop_reason") == "max_tokens":
+                raise RuntimeError("Anthropic stream was truncated at max_tokens")
+            if kind == "content_block_delta":
+                text = event.get("delta", {}).get("text", "")
+                if text:
+                    parts.append(text)
+                    on_token(text)
+            elif kind == "message_stop":
+                completed = True
+        if not completed:
+            raise RuntimeError("Anthropic stream ended before message_stop")
+        return "".join(parts)

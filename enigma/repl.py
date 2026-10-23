@@ -3,9 +3,12 @@
 封装 spinner、非阻塞输入、消息队列显示、中断处理，
 供 cli.py 的主循环调用。"""
 
+import queue
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 
 SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
 DIM = "\033[2m"
@@ -15,6 +18,75 @@ YELLOW = "\033[33m"
 CYAN = "\033[36m"
 ERASE_LINE = "\033[2K"
 CURSOR_UP = "\033[A"
+
+
+@dataclass
+class ApprovalRequest:
+    name: str
+    args: dict
+    decision: bool = False
+    ready: threading.Event = field(default_factory=threading.Event)
+
+
+class ApprovalBroker:
+    """Workers request decisions; only the terminal's owner reads input."""
+
+    def __init__(self, cancelled=lambda: False):
+        self.requests = queue.Queue()
+        self.closed = threading.Event()
+        self.cancelled = cancelled
+
+    def request(self, name, args):
+        request = ApprovalRequest(name, args)
+        self.requests.put(request)
+        while not request.ready.wait(0.05):
+            if self.closed.is_set() or self.cancelled():
+                request.ready.set()
+                return False
+        return request.decision
+
+    def pending(self):
+        try:
+            request = self.requests.get_nowait()
+        except queue.Empty:
+            return None
+        return None if request.ready.is_set() else request
+
+    def close(self):
+        self.closed.set()
+
+
+class KeyInput:
+    """Use cbreak only while polling; restore cooked mode for input() dialogs."""
+
+    def __enter__(self):
+        self.fd = None
+        self.saved = None
+        if not _is_windows() and sys.stdin.isatty():
+            import termios
+            import tty
+            self.fd = sys.stdin.fileno()
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *_exc):
+        self.restore()
+
+    def restore(self):
+        if self.saved is not None:
+            import termios
+            termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
+
+    @contextmanager
+    def cooked(self):
+        self.restore()
+        try:
+            yield
+        finally:
+            if self.saved is not None:
+                import tty
+                tty.setcbreak(self.fd)
 
 
 def _is_windows():

@@ -4,7 +4,7 @@
 这个对象会被不断写入 task_state.json，供运行中观察和运行后复盘。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
 
@@ -38,6 +38,8 @@ class TaskState:
     final_answer: str = ""
     checkpoint_id: str = ""
     resume_status: str = ""
+    verification_status: str = "unverified"
+    verification_evidence: object = field(default_factory=dict)
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -59,6 +61,8 @@ class TaskState:
             final_answer=str(data.get("final_answer", "")),
             checkpoint_id=str(data.get("checkpoint_id", "")),
             resume_status=str(data.get("resume_status", "")),
+            verification_status=str(data.get("verification_status", "unverified")),
+            verification_evidence=data.get("verification_evidence", {}),
         )
 
     def record_attempt(self):
@@ -90,6 +94,7 @@ class TaskState:
         return self.stop(STOP_REASON_MODEL_ERROR, status=STATUS_FAILED, final_answer=final_answer)
 
     def finish_success(self, final_answer):
+        """The model turn ended; independent verification has its own status."""
         self.status = STATUS_COMPLETED
         self.stop_reason = STOP_REASON_FINAL_ANSWER_RETURNED
         self.final_answer = str(final_answer)
@@ -108,4 +113,6 @@ class TaskState:
             "final_answer": self.final_answer,
             "checkpoint_id": self.checkpoint_id,
             "resume_status": self.resume_status,
+            "verification_status": self.verification_status,
+            "verification_evidence": self.verification_evidence,
         }

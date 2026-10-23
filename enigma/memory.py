@@ -5,12 +5,12 @@ session history 负责保存完整事件流；这个模块只保存更小的一�
 这样下一轮 prompt 还能接上上一轮，但不会被整段历史塞满。
 """
 
-from collections import Counter
-from dataclasses import dataclass
-from datetime import datetime
 import hashlib
 import math
 import re
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .workspace import clip, now
@@ -122,6 +122,7 @@ class DurableMemoryStore:
         self.root = Path(root)
         self.index_path = self.root / "MEMORY.md"
         self.topics_dir = self.root / "topics"
+        self.sanitize = lambda value: value
 
     def topic_slugs(self):
         return [topic["topic"] for topic in self.load_index()]
@@ -245,7 +246,7 @@ class DurableMemoryStore:
             lines.append(f"- [{topic['topic']}](topics/{topic['topic']}.md): {topic['title']}")
             lines.append(f"  - summary: {topic['summary']}")
             lines.append(f"  - tags: {', '.join(topic['tags'])}")
-        self.index_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        self.index_path.write_text(self.sanitize("\n".join(lines).rstrip() + "\n"), encoding="utf-8")
 
     def _write_topic(self, topic, notes):
         self.topics_dir.mkdir(parents=True, exist_ok=True)
@@ -261,7 +262,7 @@ class DurableMemoryStore:
             "## Notes",
         ]
         for raw_note in notes:
-            note = MemoryNote.from_value(raw_note, topic=topic)
+            note = MemoryNote.from_value(self.sanitize(raw_note), topic=topic)
             if not note.text:
                 continue
             lines.append(f"- {note.text}")
@@ -407,7 +408,14 @@ def file_freshness(raw_path, workspace_root=None):
 
 
 def _tokenize_terms(text):
-    return [token.lower() for token in re.findall(r"[A-Za-z0-9_]+", str(text))]
+    terms = []
+    for token in re.findall(r"[\u3400-\u9fff]+|[^\W_\u3400-\u9fff]+(?:_[^\W_\u3400-\u9fff]+)*", str(text), re.UNICODE):
+        if re.fullmatch(r"[\u3400-\u9fff]+", token):
+            terms.extend(token)
+            terms.extend(token[i:i + 2] for i in range(len(token) - 1))
+        else:
+            terms.append(token.lower())
+    return terms
 
 
 def _tokenize(text):
@@ -443,7 +451,7 @@ def _bm25_scores(query_terms, documents, k1=1.2, b=0.75):
 
     scores = []
     corpus_size = len(documents)
-    for counts, document_length in zip(document_counts, document_lengths):
+    for counts, document_length in zip(document_counts, document_lengths, strict=True):
         score = 0.0
         for term in query_terms:
             term_frequency = counts.get(term, 0)
@@ -462,7 +470,7 @@ def _rank_notes_by_query(candidates, query, limit=3):
     documents = [_note_search_terms(note, extra_text) for note, extra_text, _ in candidates]
     bm25_scores = _bm25_scores(query_terms, documents)
     ranked = []
-    for (note, _extra_text, fallback_index), bm25_score in zip(candidates, bm25_scores):
+    for (note, _extra_text, fallback_index), bm25_score in zip(candidates, bm25_scores, strict=False):
         note_tags = {tag.lower() for tag in note.get("tags", [])}
         exact_tag_match = int(bool(query_tokens & note_tags))
         if exact_tag_match == 0 and bm25_score <= 0:

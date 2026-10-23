@@ -1,6 +1,6 @@
-import os
-import json
 import io
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 
 import enigma as mini_pkg
-from enigma import cli as mini_cli
 from enigma import (
     AnthropicCompatibleModelClient,
     FakeModelClient,
@@ -20,6 +19,7 @@ from enigma import (
     WorkspaceContext,
     build_welcome,
 )
+from enigma import cli as mini_cli
 from enigma.web_search import SearchResult
 
 
@@ -681,10 +681,10 @@ def test_openai_compatible_client_extracts_text_from_event_stream():
 
         def read(self):
             return (
-                'data: {"type":"response.created","response":{"id":"resp_1","output":[]}}\n'
-                'data: {"type":"response.completed","response":{"output":[{"content":[{"text":"<final>stream ok</final>"}]}]}}\n'
-                "data: [DONE]\n"
-            ).encode("utf-8")
+                b'data: {"type":"response.created","response":{"id":"resp_1","output":[]}}\n'
+                b'data: {"type":"response.completed","response":{"output":[{"content":[{"text":"<final>stream ok</final>"}]}]}}\n'
+                b"data: [DONE]\n"
+            )
 
     client = OpenAICompatibleModelClient(
         model="right.codes/codex-mini",
@@ -712,14 +712,14 @@ def test_openai_compatible_client_extracts_text_from_event_stream_deltas():
 
         def read(self):
             return (
-                'event: response.output_text.delta\n'
-                'data: {"type":"response.output_text.delta","delta":"<final>"}\n'
-                'event: response.output_text.delta\n'
-                'data: {"type":"response.output_text.delta","delta":"OK"}\n'
-                'event: response.output_text.done\n'
-                'data: {"type":"response.output_text.done","text":"<final>OK</final>"}\n'
-                "data: [DONE]\n"
-            ).encode("utf-8")
+                b'event: response.output_text.delta\n'
+                b'data: {"type":"response.output_text.delta","delta":"<final>"}\n'
+                b'event: response.output_text.delta\n'
+                b'data: {"type":"response.output_text.delta","delta":"OK"}\n'
+                b'event: response.output_text.done\n'
+                b'data: {"type":"response.output_text.done","text":"<final>OK</final>"}\n'
+                b"data: [DONE]\n"
+            )
 
     client = OpenAICompatibleModelClient(
         model="right.codes/codex-mini",

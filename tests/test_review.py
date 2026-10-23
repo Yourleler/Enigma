@@ -4,7 +4,7 @@ import json
 from unittest.mock import patch
 
 from enigma import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
-from enigma.cli import handle_builtin_command, _build_review_prompt
+from enigma.cli import _build_review_prompt, handle_builtin_command
 
 
 def build_workspace(tmp_path):

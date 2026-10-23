@@ -11,7 +11,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-
 SECRET_NAME_RE = re.compile(r"(api[_-]?key|token|secret|password|passwd|private[_-]?key)", re.I)
 SECRET_VALUE_RE = re.compile(r"(?i)(sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]{12,}|AKIA[0-9A-Z]{12,})")
 
@@ -70,7 +69,7 @@ def scan_python_file(path, repo_root):
         return [
             StaticFinding(
                 rule_id="PY_SYNTAX_ERROR",
-                severity="warning",
+                severity="error",
                 category="syntax",
                 file=rel,
                 line=exc.lineno or 0,

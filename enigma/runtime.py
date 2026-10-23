@@ -4,20 +4,21 @@ Enigma 就是包在模型外面的控制循环：负责组 prompt、解析模型
 校验并执行工具、写 trace、更新工作记忆，以及在合适的时候停下来。
 """
 
+import hashlib
 import json
 import os
 import re
 import sys
 import textwrap
-import uuid
-import hashlib
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import memory as memorylib
 from . import display as displaymod
+from . import memory as memorylib
+from . import tools as toolkit
 from .context_manager import ContextManager, estimate_tokens
 from .models import should_compact
 from .orchestration import Orchestrator
@@ -26,7 +27,6 @@ from .run_store import RunStore
 from .skills import build_skill_metadata_block
 from .storage import SessionDB
 from .task_state import TaskState
-from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
@@ -139,13 +139,16 @@ class SessionStore:
     def __init__(self, root):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.sanitize = lambda value: value
 
     def path(self, session_id):
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", str(session_id)):
+            raise ValueError("invalid session id")
         return self.root / f"{session_id}.json"
 
     def save(self, session):
         path = self.path(session["id"])
-        path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+        RunStore._write_json_atomic(path, self.sanitize(session))
         return path
 
     def load(self, session_id):
@@ -178,6 +181,9 @@ class Enigma:
         show_tool_activity=False,
         show_token_usage=False,
         tool_activity_stream=None,
+        approval_callback=None,
+        completion_check=None,
+        allowed_tools=None,
     ):
         # 保存外部已经装配好的核心依赖：模型客户端、工作区快照和 session 存储。
         self.model_client = model_client
@@ -187,8 +193,15 @@ class Enigma:
 
         # 记录本次运行的策略开关和执行上限，后续 ask/tool 循环都会读取这些配置。
         self.approval_policy = approval_policy
+        self.approval_callback = approval_callback
+        self.completion_check = completion_check
+        self.allowed_tools = None if allowed_tools is None else set(allowed_tools)
         self.max_steps = max_steps
         self.max_new_tokens = max_new_tokens
+        if not isinstance(max_steps, int) or max_steps < 0:
+            raise ValueError("max_steps must be a non-negative integer")
+        if not isinstance(max_new_tokens, int) or max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be a positive integer")
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
@@ -225,6 +238,8 @@ class Enigma:
             self.session.setdefault("memory", memorylib.default_memory_state()),
             workspace_root=self.root,
         )
+        if self.memory.durable_store is not None:
+            self.memory.durable_store.sanitize = self.redact_artifact
         self.session["memory"] = self.memory.to_dict()
 
         # 初始化工具表、系统 prompt prefix 和上下文管理器，它们共同决定每轮模型输入。
@@ -244,6 +259,8 @@ class Enigma:
 
         # 计算恢复状态并立即保存 session，确保新建或恢复后的会话路径可用。
         self.resume_state = self.evaluate_resume_state()
+        self.session_store.sanitize = self.redact_artifact
+        self.run_store.sanitize = self.redact_artifact
         self.session_path = self.session_store.save(self.session)
 
         # 以下字段记录当前运行中的临时状态和最近一次 ask 的元信息。
@@ -251,6 +268,7 @@ class Enigma:
         self.current_run_dir = None
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
+        self._report_prompt_metadata = None
         self.last_durable_promotions = []
         self.last_durable_rejections = []
         self.last_durable_superseded = []
@@ -262,6 +280,7 @@ class Enigma:
         self._last_result_header = ""
         self._last_preview_header_printed = False
         self._last_diff_info = None
+        self._shell_outcome = {}
         self._cancel_requested = False
         self._last_prefix_refresh = {
             "workspace_changed": False,
@@ -312,6 +331,7 @@ class Enigma:
             "shell_env_allowlist": list(self.shell_env_allowlist),
             "workspace_fingerprint": getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", self.workspace.fingerprint()),
             "tool_signature": self.tool_signature(),
+            "allowed_tools": sorted(self.allowed_tools) if self.allowed_tools is not None else None,
         }
 
     def checkpoint_state(self):
@@ -479,6 +499,8 @@ class Enigma:
 
     def build_tools(self):
         tools = toolkit.build_tool_registry(self)
+        if self.allowed_tools is not None:
+            tools = {name: spec for name, spec in tools.items() if name in self.allowed_tools}
         if self.plan_mode:
             tools = {name: spec for name, spec in tools.items() if not spec.get("risky", False)}
         return tools
@@ -711,7 +733,7 @@ class Enigma:
             self.session_db.start_session(
                 self.session["id"],
                 parent_id=self.session.get("parent_id"),
-                title=clip(str(self.session.get("title", "")), 200) or None,
+                title=self.redact_text(clip(str(self.session.get("title", "")), 200)) or None,
                 model=str(getattr(self.model_client, "model", "")) or None,
                 cwd=str(self.root),
             )
@@ -728,7 +750,7 @@ class Enigma:
                 kind,
                 self.redact_text(str(content or "")),
                 token_estimate=estimate_tokens(str(content or "")),
-                **extra,
+                **self.redact_artifact(extra),
             )
         except Exception:
             pass
@@ -1063,7 +1085,7 @@ class Enigma:
             return REDACTED_VALUE
         if isinstance(value, dict):
             return {
-                str(item_key): self.redact_artifact(item_value, key=item_key)
+                self.redact_text(str(item_key)): self.redact_artifact(item_value, key=item_key)
                 for item_key, item_value in value.items()
             }
         if isinstance(value, list):
@@ -1561,6 +1583,36 @@ class Enigma:
         return promoted, rejections, superseded
 
     def ask(self, user_message):
+        """Run a turn and persist terminal state even when a dependency fails."""
+        self.current_task_state = None
+        self._run_phase = "persistence"
+        try:
+            return self._ask_impl(user_message)
+        except (Exception, KeyboardInterrupt) as exc:
+            state = self.current_task_state
+            if state is not None:
+                cancelled = isinstance(exc, KeyboardInterrupt) or self._cancel_requested
+                state.stop(
+                    "user_cancel" if cancelled else {
+                        "model": "model_error", "persistence": "persistence_error",
+                        "verification": "verification_failed", "context": "context_error",
+                        "tool": "tool_failed",
+                    }.get(self._run_phase, "runtime_error"),
+                    status="stopped" if cancelled else "failed",
+                    final_answer=self.redact_text(str(exc)),
+                )
+                try:
+                    self.run_store.write_task_state(state)
+                    self.emit_trace(state, "run_failed", {"error": str(exc), "error_type": type(exc).__name__, "stop_reason": state.stop_reason})
+                    self.run_store.write_report(state, self.build_report(state))
+                except (OSError, TypeError, ValueError) as persistence_error:
+                    print(self.redact_text(f"Could not persist failed run: {persistence_error}"), file=sys.stderr)
+                self._cleanup_plan_file()
+            raise
+        finally:
+            self._cancel_requested = False
+
+    def _ask_impl(self, user_message):
         """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
 
         为什么存在：
@@ -1615,7 +1667,7 @@ class Enigma:
         attempts = 0
         # 小 max_steps 时允许几次格式修正；大 max_steps 时只额外给 4 次重试，
         # 避免 malformed response 把模型调用次数放大到工具预算的 3 倍。
-        max_attempts = min(self.max_steps * 3, self.max_steps + 4)
+        max_attempts = max(1, min(self.max_steps * 3, self.max_steps + 4))
 
         self._last_step_results = []
         self._last_preview_lines = 0
@@ -1629,20 +1681,16 @@ class Enigma:
         # 3. 行动：如果是工具调用，就执行工具
         # 4. 记录：把结果写回 history / task_state / trace / memory
         # 然后进入下一轮，直到停机条件满足
-        while tool_steps < self.max_steps and attempts < max_attempts:
+        while attempts < max_attempts:
             if self.check_cancel():
-                final = "Stopped by user."
-                task_state.stop("user_cancel", final_answer=final)
-                self.append_session_history({"role": "assistant", "content": final, "created_at": now()})
-                self.run_store.write_task_state(task_state)
-                self._cleanup_plan_file()
-                return final
+                return self._finish_cancel(task_state)
             attempts += 1
             task_state.record_attempt()
             self.run_store.write_task_state(task_state)
 
             # 每一轮都重新构建 prompt，因为上一轮可能新增了工具结果、memory 或 checkpoint。
             prompt_started_at = time.monotonic()
+            self._run_phase = "context"
             prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
             self.emit_trace(
                 task_state,
@@ -1724,6 +1772,7 @@ class Enigma:
 
             # 调模型：模型会返回一段文本，后面 parse() 会判断它是工具调用、重试提示还是最终答案。
             model_started_at = time.monotonic()
+            self._run_phase = "model"
             on_token = self._make_stream_callback() if self.show_tool_activity else None
             raw = self.model_client.complete(
                 prompt,
@@ -1732,6 +1781,7 @@ class Enigma:
                 prompt_cache_retention=prompt_cache_retention,
                 on_token=on_token,
             )
+            self._run_phase = "persistence"
             if on_token:
                 print("", file=self.tool_activity_stream)
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
@@ -1759,6 +1809,8 @@ class Enigma:
                     pass
 
             kind, payload = self.parse(raw)
+            if self.plan_mode and kind == "retry" and str(raw).strip() and not any(tag in str(raw) for tag in ("<tool", "<plan", "<final")):
+                kind, payload = "plan", str(raw).strip()
             self.emit_trace(
                 task_state,
                 "model_parsed",
@@ -1770,6 +1822,10 @@ class Enigma:
             )
 
             if kind == "tool":
+                if self.check_cancel():
+                    return self._finish_cancel(task_state)
+                if tool_steps >= self.max_steps:
+                    break
                 # 模型要求调用工具：取出工具名和参数，执行后把工具结果写回 history，
                 # 下一轮模型就能基于工具结果继续推理。
                 tool_steps += 1
@@ -1794,6 +1850,7 @@ class Enigma:
                         "message": tool_message,
                         "content": result,
                         "created_at": now(),
+                        "metadata": dict(self._last_tool_result_metadata),
                     }
                 )
                 self.run_store.write_task_state(task_state)
@@ -1824,6 +1881,8 @@ class Enigma:
                 continue
 
             if kind == "plan":
+                if self.check_cancel():
+                    return self._finish_cancel(task_state)
                 plan_content = payload
                 self.append_session_history(
                     {
@@ -1832,7 +1891,7 @@ class Enigma:
                         "created_at": now(),
                     }
                 )
-                from .task_state import STOP_REASON_PLAN_READY, STATUS_COMPLETED
+                from .task_state import STATUS_COMPLETED, STOP_REASON_PLAN_READY
                 task_state.stop(STOP_REASON_PLAN_READY, status=STATUS_COMPLETED, final_answer=plan_content)
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="plan_ready")
                 self.run_store.write_task_state(task_state)
@@ -1859,11 +1918,33 @@ class Enigma:
                 self.append_session_history(
                     {"role": "assistant", "content": plan_content, "created_at": now()}
                 )
-                from .task_state import STOP_REASON_PLAN_READY, STATUS_COMPLETED
+                from .task_state import STATUS_COMPLETED, STOP_REASON_PLAN_READY
                 task_state.stop(STOP_REASON_PLAN_READY, status=STATUS_COMPLETED, final_answer=plan_content)
                 self.run_store.write_task_state(task_state)
                 return PlanResult(plan=plan_content, session_id=self.session["id"])
             final = (payload or raw).strip()
+            if self.check_cancel():
+                return self._finish_cancel(task_state)
+            if self.completion_check is not None:
+                self._run_phase = "verification"
+                passed, evidence = self.completion_check(self)
+                if self.check_cancel():
+                    task_state.verification_evidence = self.redact_artifact(evidence)
+                    return self._finish_cancel(task_state)
+                if not isinstance(passed, bool):
+                    raise TypeError("completion_check must return (bool, evidence)")
+                self._run_phase = "persistence"
+                task_state.verification_status = "verified" if passed else "failed"
+                task_state.verification_evidence = self.redact_artifact(evidence)
+                if not passed:
+                    final = "Stopped: completion verification failed. " + str(evidence)
+                    task_state.stop("verification_failed", final_answer=final)
+                    self.append_session_history({"role": "assistant", "content": final, "created_at": now()})
+                    self.run_store.write_task_state(task_state)
+                    self.emit_trace(task_state, "verification_failed", {"evidence": evidence})
+                    self.run_store.write_report(task_state, self.build_report(task_state))
+                    self._cleanup_plan_file()
+                    return final
             self.append_session_history({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
             if self._should_reflect(ep_notes_at_ask_start, user_message):
@@ -1895,6 +1976,8 @@ class Enigma:
 
         # 循环退出但没有最终答案：说明要么模型连续给不出有效格式，
         # 要么工具步数达到上限。这里统一生成停止说明并落盘。
+        if self.check_cancel():
+            return self._finish_cancel(task_state)
         if attempts >= max_attempts and tool_steps < self.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
             task_state.stop_retry_limit(final)
@@ -1929,7 +2012,17 @@ class Enigma:
         self._cleanup_plan_file()
         return final
 
-    def run_tool(self, name, args):
+    def _finish_cancel(self, task_state):
+        final = "Stopped by user."
+        task_state.stop("user_cancel", final_answer=final)
+        self.append_session_history({"role": "assistant", "content": final, "created_at": now()})
+        self.run_store.write_task_state(task_state)
+        self.emit_trace(task_state, "run_stopped", {"stop_reason": "user_cancel"})
+        self.run_store.write_report(task_state, self.build_report(task_state))
+        self._cleanup_plan_file()
+        return final
+
+    def run_tool(self, name, args, *, check_repetition=True):
         """执行一次工具调用，并在执行前后套上完整护栏。
 
         为什么存在：
@@ -1952,6 +2045,7 @@ class Enigma:
         # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
         # -> 真正执行 -> 更新记忆。
         self._last_diff_info = None
+        self._shell_outcome = {}
         tool = self.tools.get(name)
         if tool is None:
             self._last_tool_result_metadata = {
@@ -1984,7 +2078,7 @@ class Enigma:
                 "diff_summary": [],
             }
             return message
-        if self.repeated_tool_call(name, args):
+        if check_repetition and self.repeated_tool_call(name, args):
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "repeated_identical_call",
@@ -2052,14 +2146,18 @@ class Enigma:
             tool_status = "ok"
             tool_error_code = ""
             if name == "run_shell":
+                shell_outcome = dict(getattr(self, "_shell_outcome", {}) or {})
                 match = re.search(r"exit_code:\s*(-?\d+)", result)
-                exit_code = int(match.group(1)) if match else 0
+                exit_code = shell_outcome.get("exit_code", int(match.group(1)) if match else None)
                 if exit_code != 0 and workspace_changed:
                     tool_status = "partial_success"
                     tool_error_code = "tool_partial_success"
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
+                if shell_outcome.get("timed_out") or shell_outcome.get("aborted"):
+                    tool_status = "partial_success" if workspace_changed else "error"
+                    tool_error_code = "tool_timeout" if shell_outcome.get("timed_out") else "user_cancel"
             self.update_memory_after_tool(name, args, result)
             self._last_tool_result_metadata = {
                 "tool_status": tool_status,
@@ -2071,6 +2169,7 @@ class Enigma:
                 "workspace_changed": workspace_changed,
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
+                **(shell_outcome if name == "run_shell" else {}),
             }
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return result
@@ -2169,7 +2268,7 @@ class Enigma:
         prev_lines = self._last_preview_lines
         if prev_lines > 0 and self._last_preview_header_printed:
             move_up = prev_lines
-            for i in range(move_up):
+            for _i in range(move_up):
                 print("\033[A\033[2K", end="", file=stream)
             if self._last_result_compact:
                 compact_text = self._last_result_compact
@@ -2326,6 +2425,8 @@ class Enigma:
             "checkpoint_id": task_state.checkpoint_id,
             "resume_status": task_state.resume_status,
             "task_state": task_state.to_dict(),
+            "verification_status": task_state.verification_status,
+            "verification_evidence": task_state.verification_evidence,
             "prompt_metadata": self._report_prompt_metadata or self.last_prompt_metadata,
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
@@ -2384,6 +2485,8 @@ class Enigma:
             return True
         if self.approval_policy == "never":
             return False
+        if self.approval_callback is not None:
+            return self.approval_callback(name, self.redact_artifact(args)) is True
         try:
             answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
         except EOFError:
@@ -2443,11 +2546,15 @@ class Enigma:
         进入平台控制流的第一道结构化关口。
         """
         raw = str(raw)
+        first_tool = re.search(r"<tool(?:\s[^>]*)?>", raw)
         # 这里支持两种工具格式：
         # 1. <tool>...</tool> 里包 JSON，适合简短调用
         # 2. XML 风格属性/子标签，适合写文件这类多行内容
-        if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
-            body = Enigma.extract(raw, "tool")
+        if first_tool and first_tool.group() == "<tool>" and ("<final>" not in raw or first_tool.start() < raw.find("<final>")):
+            end = raw.rfind("</tool>")
+            if end < raw.find("<tool>"):
+                return "retry", Enigma.retry_notice("unterminated tool output")
+            body = raw[raw.find("<tool>") + len("<tool>"):end].strip()
             try:
                 payload = json.loads(body)
             except Exception:
@@ -2466,24 +2573,28 @@ class Enigma:
             if "message" in payload:
                 payload["message"] = clip(" ".join(str(payload.get("message", "")).split()), 160)
             return "tool", payload
-        if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
+        if first_tool and ("<final>" not in raw or first_tool.start() < raw.find("<final>")):
             payload = Enigma.parse_xml_tool(raw)
             if payload is not None:
                 return "tool", payload
             return "retry", Enigma.retry_notice()
-        if "<plan>" in raw:
-            plan_content = Enigma.extract(raw, "plan").strip()
+        if "<plan>" in raw and ("<final>" not in raw or raw.find("<plan>") < raw.find("<final>")):
+            if "</plan>" not in raw:
+                return "retry", Enigma.retry_notice("unterminated plan")
+            plan_content = raw[raw.find("<plan>") + len("<plan>"):raw.rfind("</plan>")].strip()
             if plan_content:
                 return "plan", plan_content
             return "retry", Enigma.retry_notice("model returned an empty <plan>")
         if "<final>" in raw:
-            final = Enigma.extract(raw, "final").strip()
+            if "</final>" not in raw:
+                return "retry", Enigma.retry_notice("unterminated final answer")
+            final = raw[raw.find("<final>") + len("<final>"):raw.rfind("</final>")].strip()
             if final:
                 return "final", final
             return "retry", Enigma.retry_notice("model returned an empty <final> answer")
         raw = raw.strip()
         if raw:
-            return "final", raw
+            return "retry", Enigma.retry_notice("use explicit <final> for a completed answer")
         return "retry", Enigma.retry_notice("model returned an empty response")
 
     @staticmethod
@@ -2516,7 +2627,9 @@ class Enigma:
 
     @staticmethod
     def parse_xml_tool(raw):
-        match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>", raw, re.S)
+        if re.search(r"</tool>\s*<tool(?:\s|>)", raw):
+            return None
+        match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*)</tool>", raw, re.S)
         if not match:
             return None
         attrs = Enigma.parse_attrs(match.group("attrs"))
@@ -2527,9 +2640,16 @@ class Enigma:
 
         body = match.group("body")
         args = dict(attrs)
+        remaining = body
         for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
-            if f"<{key}>" in body:
-                args[key] = Enigma.extract_raw(body, key)
+            if f"<{key}>" in remaining:
+                opening = remaining.find(f"<{key}>")
+                start = opening + len(f"<{key}>")
+                end = remaining.rfind(f"</{key}>")
+                if end < start:
+                    return None
+                args[key] = remaining[start:end]
+                remaining = remaining[:opening] + remaining[end + len(f"</{key}>"):]
 
         body_text = body.strip("\n")
         if name == "write_file" and "content" not in args and body_text:

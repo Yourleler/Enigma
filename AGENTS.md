@@ -32,7 +32,7 @@ uv run enigma --provider anthropic                  # Anthropic 兼容 API
 
 ## 架构
 
-所有源码位于 `enigma/` 目录下（约 16 个模块）。`runtime.py` 中的 `Enigma` 类是核心调度器。
+所有源码位于 `enigma/` 目录下（22 个 Python 模块）。`runtime.py` 中的 `Enigma` 类是核心调度器。
 
 ### 核心循环 (`runtime.py` — `Enigma.ask()`)
 
@@ -65,10 +65,11 @@ uv run enigma --provider anthropic                  # Anthropic 兼容 API
 
 ### 安全模型
 
-- 所有文件路径锚定在工作区根目录（防止路径穿越）
+- 文件工具路径锚定在工作区根目录（防止路径穿越）
+- shell 是经过审批的宿主执行能力，cwd 不构成 OS 沙箱；结果标明 unrestricted
 - 工具审批策略：`ask` / `auto` / `never`
 - 子 agent / delegate 以只读模式运行
-- 跟踪和报告中对密钥进行脱敏
+- 会话、任务状态、跟踪、报告、数据库字段和长期记忆写入统一对已声明密钥脱敏
 - 重复相同工具调用检测，防止死循环
 
 ### 模型 I/O 协议
@@ -81,4 +82,4 @@ uv run enigma --provider anthropic                  # Anthropic 兼容 API
 
 ### 测试结构
 
-`tests/` 下共 10 个测试文件。最大的是 `test_enigma.py`（约 50 个测试），覆盖核心 agent 循环。`test_safety_invariants.py` 覆盖路径穿越、审批拒绝和密钥脱敏。测试中使用 `models.py` 中的 `FakeModelClient`，无需真实模型调用。
+`tests/` 下有 15 个测试文件，覆盖核心循环、安全、恢复、编排和稳定性回归。`test_stabilization.py` 覆盖审批队列、异常收尾、流式响应、独立验收和 shell 取消。测试使用 `FakeModelClient` 和受控响应，无需真实模型调用。

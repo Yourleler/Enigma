@@ -142,6 +142,7 @@ def test_startup_memory_is_injected_into_context_manager_prompt(tmp_path):
 def test_rolling_summary_survives_compact_and_comes_from_session_db(tmp_path):
     """/compact 后，稳定记忆从磁盘重载，滚动摘要存进 SessionDB，下一轮 prompt 能拿到。"""
     import json
+
     from enigma import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
     from enigma.context_manager import ContextManager
 
